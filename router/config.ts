@@ -56,3 +56,11 @@ export const MAX_REBASES = 2;
 export const MAX_ATTEMPTS = 2;
 export const RETRY_AFTER_MS = 60 * 60 * 1000;
 export const STUCK_AFTER_MS = 90 * 60 * 1000;
+
+// A problem in .github/factory.json. The router reports its message on the queued issue, so it names the field.
+export class ConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConfigError';
+  }
+}
