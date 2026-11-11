@@ -1,0 +1,60 @@
+# Paths the maintainer approves before the factory builds or ships a change (AGENTS.md "Ask first").
+# The router checks the brief's Touches list against this file, and the PR's diff again before the review and fix
+# agents run on the branch and before marking it ready.
+# Globs: ** crosses directories, * stays inside one.
+
+# Safety gates and hook wiring
+plugin/hooks/**
+plugin/__init__.py
+
+# Tracker schema, tool contract and its public reference
+plugin/servers/tracker/src/db.ts
+plugin/servers/tracker/src/tools.ts
+plugin/servers/tracker/src/mcp.ts
+tests/tracker/fixtures/tools-list.json
+docs/tracker-api.md
+
+# Versions, manifests and release
+package.json
+plugin/package.json
+plugin/plugin.yaml
+plugin/.claude-plugin/plugin.json
+plugin/servers/tracker/package.json
+server.json
+registry/**
+.claude-plugin/**
+
+# Dependencies
+dev/package.json
+dev/package-lock.json
+
+# The factory itself and the agents' own instructions. Claude Code loads a .claude/ directory from any level.
+.github/**
+**/.claude/**
+AGENTS.md
+factory/**
+
+# Files Matt Pocock's skills read as the repo's own docs (domain language, ADRs, agent setup), and the factory's
+# scratch directory, where the stages read his skills and their context from.
+docs/agents/**
+GLOSSARY.md
+GLOSSARY-MAP.md
+CONTEXT.md
+CONTEXT-MAP.md
+docs/adr/**
+**/docs/adr/**
+.factory/**
+
+# Files the agents load or run: Claude Code settings and instructions, git config the checkout applies, and the
+# tool configs the test and lint commands read. From review on, agents run on the PR branch.
+.mcp.json
+.claude.json
+**/CLAUDE.md
+**/CLAUDE.local.md
+CONTRIBUTING.md
+.gitignore
+.gitmodules
+.husky/**
+.ripgreprc
+biome.json
+tsconfig.json
