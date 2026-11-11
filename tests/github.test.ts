@@ -1,18 +1,23 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  branchHead,
+  cancelRun,
   client,
+  collaboratorRole,
   commentEditors,
+  dispatchStage,
   findPull,
+  findRun,
   type Gh,
   GitHubError,
-  latestCiRun,
   latestLabeler,
-  latestStageRun,
   listComments,
   listReviews,
+  postReview,
   pullBranch,
   pullSnapshot,
+  readRepoFile,
   removeLabel,
   setStageLabel,
 } from '../router/github.ts';
@@ -96,31 +101,56 @@ const wfRun = (id: number, extra: Record<string, unknown>) => ({
   ...extra,
 });
 
-test('latestStageRun skips runs that were not dispatched from the stage workflow in this repo', async () => {
-  const good = { display_title: 'factory-build #7', event: 'workflow_dispatch', path: '.github/workflows/factory-build.yml' };
+test('findRun finds the attempt\'s run and skips runs not dispatched from the stage workflow in this repo', async () => {
+  const good = { display_title: 'factory-build #7 mhs1abc', event: 'workflow_dispatch', path: '.github/workflows/factory-stage.yml' };
   const gh = fake(() => ({
     workflow_runs: [
       wfRun(1, { ...good, head_repository: { full_name: 'mallory/r' } }),
       wfRun(2, { ...good, event: 'pull_request' }),
       wfRun(3, { ...good, path: '.github/workflows/x.yml' }),
-      wfRun(4, { ...good, display_title: 'factory-build #8' }),
-      wfRun(5, good),
+      wfRun(4, { ...good, display_title: 'factory-build #8 mhs1abc' }),
+      wfRun(5, { ...good, display_title: 'factory-build #7 older1' }),
+      wfRun(6, good),
     ],
   }));
-  assert.equal((await latestStageRun(gh, 'build', 7))?.url, 'https://github.com/o/r/actions/runs/5');
-  assert.equal(await latestStageRun(fake(() => ({ workflow_runs: [wfRun(1, { ...good, event: 'push' })] })), 'build', 7), null);
+  assert.equal(dig(await findRun(gh, 'build', 7, 'mhs1abc'), 'html_url'), 'https://github.com/o/r/actions/runs/6');
+  assert.match(gh.calls[0]?.path ?? '', /workflows\/factory-stage\.yml\/runs/);
+  assert.equal(await findRun(gh, 'verify', 7, 'mhs1abc'), null);
 });
 
-test('latestCiRun skips a fork\'s run on the same commit and runs on another branch', async () => {
-  const gh = fake(() => ({
-    workflow_runs: [
-      wfRun(1, { head_branch: 'factory/issue-7', head_repository: { full_name: 'mallory/r' } }),
-      wfRun(2, { head_branch: 'factory/issue-8' }),
-      wfRun(3, { head_branch: 'factory/issue-7' }),
-    ],
-  }));
-  assert.equal((await latestCiRun(gh, 7, 'sha-1'))?.url, 'https://github.com/o/r/actions/runs/3');
-  assert.match(gh.calls[0]?.path ?? '', /head_sha=sha-1/);
+test('dispatchStage sends the stage, issue and attempt on the default branch', async () => {
+  const gh = fake(() => undefined);
+  await dispatchStage(gh, 'verify', 7, 'mhs1abc', 'trunk');
+  assert.deepEqual(gh.calls[0], { method: 'POST', path: '/repos/o/r/actions/workflows/factory-stage.yml/dispatches', body: { ref: 'trunk', inputs: { stage: 'verify', issue: '7', attempt: 'mhs1abc' } } });
+});
+
+test('cancelRun accepts a run that already finished', async () => {
+  await cancelRun({ repo: 'o/r', call: async () => Promise.reject(new GitHubError('done', 409)) }, 5);
+  await assert.rejects(cancelRun({ repo: 'o/r', call: async () => Promise.reject(new GitHubError('no', 403)) }, 5), /no/);
+});
+
+test('readRepoFile decodes base64 and treats 404 as missing', async () => {
+  const gh: Gh = { repo: 'o/r', call: async (_m, path) => (path.includes('missing') ? Promise.reject(new GitHubError('nf', 404)) : { content: Buffer.from('{"version":1}').toString('base64') }) };
+  assert.equal(await readRepoFile(gh, '.github/factory.json', 'main'), '{"version":1}');
+  assert.equal(await readRepoFile(gh, 'missing', 'main'), null);
+});
+
+test('branchHead returns the commit, or null for a branch that does not exist', async () => {
+  const gh: Gh = { repo: 'o/r', call: async (_m, path) => (path.endsWith('factory/issue-7') ? Promise.reject(new GitHubError('nf', 404)) : { object: { sha: 'abc' } }) };
+  assert.equal(await branchHead(gh, 'main'), 'abc');
+  assert.equal(await branchHead(gh, 'factory/issue-7'), null);
+});
+
+test('collaboratorRole reads role_name and treats 404 as no access', async () => {
+  const gh: Gh = { repo: 'o/r', call: async (_m, path) => (path.includes('stranger') ? Promise.reject(new GitHubError('nf', 404)) : { permission: 'write', role_name: 'maintain' }) };
+  assert.equal(await collaboratorRole(gh, 'alice'), 'maintain');
+  assert.equal(await collaboratorRole(gh, 'stranger'), null);
+});
+
+test('postReview pins the review to the commit that was reviewed', async () => {
+  const gh = fake(() => undefined);
+  await postReview(gh, 51, 'body', 'abc');
+  assert.deepEqual(gh.calls[0]?.body, { event: 'COMMENT', body: 'body', commit_id: 'abc' });
 });
 
 test('commentEditors looks up every id in batches and names bots as REST does', async () => {

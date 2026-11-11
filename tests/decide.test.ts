@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { Stage } from '../router/config.ts';
+import { RUNNER_FOR, type Stage } from '../router/config.ts';
 import {
   type Action,
   type Ctx,
@@ -9,25 +9,40 @@ import {
   next,
   type PullSnapshot,
   type RunSnapshot,
+  settle,
   sweep,
 } from '../router/decide.ts';
 import type { FactoryState } from '../router/markers.ts';
 
 const NOW = new Date('2026-11-09T12:00:00Z');
 const SINCE = '2026-11-09T11:00:00.000Z';
-const ctx: Ctx = { now: NOW, risky: ['plugin/hooks/**', 'factory/**', 'AGENTS.md', '.claude/**'] };
+// The attempt every helper state, run, brief, PR footer and review carries unless a test says otherwise.
+const A = 'a1';
+const ctx: Ctx = {
+  now: NOW,
+  risky: ['plugin/hooks/**', 'factory/**', 'AGENTS.md', '.claude/**'],
+  limits: { maxRounds: 3, maxRebases: 2, maxAttempts: 2, maxActive: 1 },
+  // adamwardecki holds both roles; alice may queue but not approve.
+  can: (role, login) => login === 'adamwardecki' || (role === 'queue' && login === 'alice'),
+  fallbackReviewer: 'adamwardecki',
+};
+const HEAD = 'sha-1';
+const AFTER_VERIFY: readonly Stage[] = ['in-review', 'fixing', 'ready', 'awaiting-approval', 'blocked', 'waiting'];
+const withActive = (maxActive: number): Ctx => ({ ...ctx, limits: { ...ctx.limits, maxActive } });
 
 function st(stage: Stage, extra: Partial<FactoryState> = {}): FactoryState {
-  return { stage, since: SINCE, round: 0, attempts: 0, runs: [], ...extra };
+  // The usual consistent picture: the PR head is HEAD, verify was dispatched on it, and later stages saw it pass.
+  const shas = stage === 'ci' ? { gatedSha: HEAD } : AFTER_VERIFY.includes(stage) ? { verifiedSha: HEAD } : {};
+  return { stage, since: SINCE, round: 0, attempts: 0, runs: [], ...(RUNNER_FOR[stage] ? { attempt: A } : {}), ...shas, ...extra };
 }
 function snap(state: FactoryState | null, extra: Partial<IssueSnapshot> = {}): IssueSnapshot {
-  return { number: 7, state, labels: [], queuedBy: null, brief: null, pr: null, review: null, lastCommand: null, lastChangesRequested: null, lastRun: null, ...extra };
+  return { number: 7, state, retiredKey: false, labels: [], queuedBy: null, brief: null, pr: null, review: null, lastCommand: null, lastChangesRequested: null, lastRun: null, ...extra };
 }
 function pr(extra: Partial<PullSnapshot> = {}): PullSnapshot {
-  return { number: 51, headSha: 'sha-1', open: true, draft: true, conflicting: false, files: ['plugin/servers/tracker/src/report.ts'], ...extra };
+  return { number: 51, headSha: 'sha-1', open: true, draft: true, conflicting: false, files: ['plugin/servers/tracker/src/report.ts'], signed: true, attempt: A, ...extra };
 }
 function run(workflow: RunSnapshot['workflow'], conclusion: string | null = 'success', extra: Partial<RunSnapshot> = {}): RunSnapshot {
-  return { workflow, conclusion, headSha: 'sha-1', url: `https://example.test/runs/${workflow}-${conclusion}`, createdAt: '2026-11-09T11:10:00Z', completedAt: '2026-11-09T11:30:00Z', ...extra };
+  return { workflow, attempt: A, conclusion, url: `https://example.test/runs/${workflow}-${conclusion}`, completedAt: '2026-11-09T11:30:00Z', ...extra };
 }
 const saves = (a: Action[]) => a.flatMap((x) => (x.kind === 'save' ? [x.state] : []));
 const stages = (a: Action[]) => saves(a).map((s) => s.stage);
@@ -75,7 +90,9 @@ test('a closed PR finishes the issue', () => {
   assert.deepEqual(decideEvent({ kind: 'pr-closed', issue: 7, pr: 51 }, snap(st('done')), ctx), []);
 });
 
-const BRIEF = { id: 900, touches: ['plugin/servers/tracker/src/report.ts'], at: '2026-11-09T11:20:00Z' };
+const BRIEF = { id: 900, touches: ['plugin/servers/tracker/src/report.ts'], at: '2026-11-09T11:20:00Z', attempt: A };
+// A signed factory review of HEAD by the current attempt.
+const rv = (blocking: number, extra: Partial<NonNullable<IssueSnapshot['review']>> = {}) => ({ blocking, at: '2026-11-09T11:20:00Z', sha: HEAD, attempt: A, ...extra });
 
 test('a plan with a brief on safe paths goes straight to building', () => {
   const a = finished(snap(st('planning'), { brief: BRIEF, labels: ['ready-for-agent'] }), run('plan'));
@@ -108,7 +125,7 @@ test('a planner that needs a human blocks the issue', () => {
 });
 
 test('a plan without a fresh brief is a failed attempt, and the second one blocks', () => {
-  const stale = { ...BRIEF, at: '2026-11-09T10:00:00Z' };
+  const stale = { ...BRIEF, attempt: 'old' };
   const first = finished(snap(st('planning'), { brief: stale, labels: ['ready-for-agent'] }), run('plan'));
   assert.deepEqual(stages(first), ['planning']);
   assert.equal(saves(first)[0]?.attempts, 1);
@@ -123,21 +140,23 @@ test('a failed stage run counts as a failed attempt', () => {
   assert.equal(saves(a)[0]?.attempts, 1);
 });
 
-test('runs for another stage, still going, cancelled, already seen or older than the stage are ignored', () => {
+test('runs for another stage or attempt, still going, cancelled or already seen are ignored', () => {
   const s = snap(st('building'), { pr: pr() });
   assert.deepEqual(finished(s, run('plan')), []);
   assert.deepEqual(finished(s, run('build', 'success', { completedAt: null })), []);
   assert.deepEqual(finished(s, run('build', 'cancelled')), []);
-  assert.deepEqual(finished(s, run('build', 'success', { createdAt: '2026-11-09T09:50:00Z', completedAt: '2026-11-09T10:00:00Z' })), []);
+  assert.deepEqual(finished(s, run('build', 'success', { attempt: 'old' })), []);
+  assert.deepEqual(finished(s, run('build', 'success', { attempt: null })), []);
   const seen = snap(st('building', { runs: ['https://example.test/runs/build-success'] }), { pr: pr() });
   assert.deepEqual(finished(seen, run('build')), []);
 });
 
-test('a build that opened a PR waits for CI', () => {
+test('a build that opened a signed PR goes to verify on its head', () => {
   const a = finished(snap(st('building'), { pr: pr() }), run('build'));
   assert.deepEqual(stages(a), ['ci']);
   assert.equal(saves(a)[0]?.pr, 51);
-  assert.deepEqual(dispatches(a), []);
+  assert.equal(saves(a)[0]?.gatedSha, HEAD);
+  assert.deepEqual(dispatches(a), ['verify']);
 });
 
 test('a build without an open PR is a failed attempt', () => {
@@ -145,15 +164,17 @@ test('a build without an open PR is a failed attempt', () => {
   assert.equal(saves(a)[0]?.attempts, 1);
 });
 
-test('green CI on the PR head goes to review; CI on an older head is ignored', () => {
+test('green verify records the verified commit and goes to review; another attempt is ignored', () => {
   const s = snap(st('ci', { pr: 51 }), { pr: pr() });
-  assert.deepEqual(stages(finished(s, run('ci'))), ['in-review']);
-  assert.deepEqual(dispatches(finished(s, run('ci'))), ['review']);
-  assert.deepEqual(finished(s, run('ci', 'success', { headSha: 'old' })), []);
+  const a = finished(s, run('verify'));
+  assert.deepEqual(stages(a), ['in-review']);
+  assert.equal(saves(a)[0]?.verifiedSha, HEAD);
+  assert.deepEqual(dispatches(a), ['review']);
+  assert.deepEqual(finished(s, run('verify', 'success', { attempt: 'old' })), []);
 });
 
 test('red CI goes to the fixer and counts a round', () => {
-  const a = finished(snap(st('ci', { pr: 51, round: 1 }), { pr: pr() }), run('ci', 'failure'));
+  const a = finished(snap(st('ci', { pr: 51, round: 1 }), { pr: pr() }), run('verify', 'failure'));
   assert.deepEqual(stages(a), ['fixing']);
   assert.equal(saves(a)[0]?.round, 2);
   assert.equal(saves(a)[0]?.fixReason, 'ci');
@@ -162,13 +183,13 @@ test('red CI goes to the fixer and counts a round', () => {
 });
 
 test('red CI after the last round blocks', () => {
-  const a = finished(snap(st('ci', { pr: 51, round: 3 }), { pr: pr() }), run('ci', 'failure'));
+  const a = finished(snap(st('ci', { pr: 51, round: 3 }), { pr: pr() }), run('verify', 'failure'));
   assert.deepEqual(stages(a), ['blocked']);
   assert.match(comments(a)[0] ?? '', /3 fix rounds/);
 });
 
 test('a review with blocking findings goes to the fixer', () => {
-  const s = snap(st('in-review', { pr: 51 }), { pr: pr(), review: { blocking: 2, at: '2026-11-09T11:20:00Z' } });
+  const s = snap(st('in-review', { pr: 51 }), { pr: pr(), review: rv(2) });
   const a = finished(s, run('review'));
   assert.deepEqual(stages(a), ['fixing']);
   assert.equal(saves(a)[0]?.fixReason, 'review');
@@ -176,7 +197,7 @@ test('a review with blocking findings goes to the fixer', () => {
 });
 
 test('a clean review on safe files marks the PR ready', () => {
-  const s = snap(st('in-review', { pr: 51 }), { pr: pr(), review: { blocking: 0, at: '2026-11-09T11:20:00Z' } });
+  const s = snap(st('in-review', { pr: 51 }), { pr: pr(), review: rv(0) });
   const a = finished(s, run('review'));
   assert.deepEqual(stages(a), ['ready']);
   assert.ok(a.some((x) => x.kind === 'pr-ready' && x.pr === 51));
@@ -185,7 +206,7 @@ test('a clean review on safe files marks the PR ready', () => {
 test('a clean review on a risky diff waits for approval', () => {
   const s = snap(st('in-review', { pr: 51 }), {
     pr: pr({ files: ['plugin/hooks/gates.ts'] }),
-    review: { blocking: 0, at: '2026-11-09T11:20:00Z' },
+    review: rv(0),
   });
   const a = finished(s, run('review'));
   assert.deepEqual(stages(a), ['awaiting-approval']);
@@ -196,7 +217,7 @@ test('a clean review on a risky diff waits for approval', () => {
 });
 
 test('a review run without a fresh factory review is a failed attempt', () => {
-  const s = snap(st('in-review', { pr: 51 }), { pr: pr(), review: { blocking: 0, at: '2026-11-09T10:00:00Z' } });
+  const s = snap(st('in-review', { pr: 51 }), { pr: pr(), review: rv(0, { attempt: 'old' }) });
   assert.equal(saves(finished(s, run('review')))[0]?.attempts, 1);
 });
 
@@ -218,7 +239,7 @@ test('/approve on a plan starts the build; only the maintainer can approve', () 
 });
 
 test('/approve on a risky diff marks the PR ready', () => {
-  const a = cmd(snap(st('awaiting-approval', { approvalFor: 'diff', pr: 51 })), 'approve');
+  const a = cmd(snap(st('awaiting-approval', { approvalFor: 'diff', pr: 51 }), { pr: pr(), review: rv(0) }), 'approve');
   assert.deepEqual(stages(a), ['ready']);
   assert.ok(a.some((x) => x.kind === 'pr-ready' && x.pr === 51));
 });
@@ -332,18 +353,9 @@ test('the sweep does not re-queue on a labelling older than the block, or by som
 
 // Run freshness
 
-test('a build run created before the stage began is ignored even if it finished after', () => {
-  const s = snap(st('building'), { pr: pr() });
-  assert.deepEqual(finished(s, run('build', 'success', { createdAt: '2026-11-09T10:55:00Z', completedAt: '2026-11-09T11:30:00Z' })), []);
-  assert.deepEqual(finished(s, run('build', 'success', { createdAt: null })), []);
-});
 
-test('a run created in the same second the stage began counts', () => {
-  // GitHub timestamps have whole seconds; the state's since has milliseconds.
-  const s = snap(st('building', { since: '2026-11-09T11:00:00.700Z' }), { pr: pr() });
-  assert.deepEqual(stages(finished(s, run('build', 'success', { createdAt: '2026-11-09T11:00:00Z' }))), ['ci']);
-  assert.deepEqual(finished(s, run('build', 'success', { createdAt: '2026-11-09T10:59:59Z' })), []);
-});
+
+
 
 // Rebases
 
@@ -367,13 +379,13 @@ test('the third rebase in a row blocks instead', () => {
 });
 
 test('reaching ready through a rebase keeps the count; any other way resets it', () => {
-  const review = { blocking: 0, at: '2026-11-09T11:20:00Z' };
+  const review = rv(0);
   const afterRebase = finished(snap(st('in-review', { pr: 51, rebases: 1, fixReason: 'rebase' }), { pr: pr(), review }), run('review'));
   assert.deepEqual(stages(afterRebase), ['ready']);
   assert.equal(saves(afterRebase)[0]?.rebases, 1);
   const afterReview = finished(snap(st('in-review', { pr: 51, rebases: 1, fixReason: 'review' }), { pr: pr(), review }), run('review'));
   assert.equal(saves(afterReview)[0]?.rebases, undefined);
-  const approved = cmd(snap(st('awaiting-approval', { approvalFor: 'diff', pr: 51, rebases: 2, fixReason: 'maintainer' })), 'approve');
+  const approved = cmd(snap(st('awaiting-approval', { approvalFor: 'diff', pr: 51, rebases: 2, fixReason: 'maintainer' }), { pr: pr(), review }), 'approve');
   assert.equal(saves(approved)[0]?.rebases, undefined);
 });
 
@@ -390,7 +402,7 @@ test('/retry after the rebase cap returns to ready with the count cleared', () =
 test('each way of blocking records why', () => {
   const failed = finished(snap(st('building', { attempts: 1 })), run('build', 'failure'));
   assert.equal(saves(failed)[0]?.blockedFor, 'attempts');
-  const rounds = finished(snap(st('ci', { pr: 51, round: 3 }), { pr: pr() }), run('ci', 'failure'));
+  const rounds = finished(snap(st('ci', { pr: 51, round: 3 }), { pr: pr() }), run('verify', 'failure'));
   assert.equal(saves(rounds)[0]?.blockedFor, 'rounds');
   const human = finished(snap(st('planning'), { labels: ['needs-info'] }), run('plan'));
   assert.equal(saves(human)[0]?.blockedFor, 'human');
@@ -400,7 +412,7 @@ test('each way of blocking records why', () => {
 });
 
 test('the round cap is also reached through blocking reviews', () => {
-  const s = snap(st('in-review', { pr: 51, round: 3 }), { pr: pr(), review: { blocking: 1, at: '2026-11-09T11:20:00Z' } });
+  const s = snap(st('in-review', { pr: 51, round: 3 }), { pr: pr(), review: rv(1) });
   const a = finished(s, run('review'));
   assert.deepEqual(stages(a), ['blocked']);
   assert.equal(saves(a)[0]?.blockedFrom, 'in-review');
@@ -415,12 +427,12 @@ test('/retry after the round cap at review sends the findings to the fixer, not 
   assert.deepEqual(dispatches(a), ['fix']);
 });
 
-test('/retry after CI was stuck or stopped waits on CI again rather than calling the fixer', () => {
+test('/retry after verify was stuck or stopped runs verify again rather than calling the fixer', () => {
   for (const blockedFor of ['stuck', 'stop'] as const) {
     const a = cmd(snap(st('blocked', { blockedFrom: 'ci', blockedFor, round: 1, pr: 51 }), { pr: pr() }), 'retry');
     assert.deepEqual(stages(a), ['ci']);
     assert.equal(saves(a)[0]?.round, 1);
-    assert.deepEqual(dispatches(a), []);
+    assert.deepEqual(dispatches(a), ['verify']);
   }
 });
 
@@ -503,10 +515,10 @@ test('a stage waiting to be retried ignores its last run until the retry', () =>
 // The diff gate: agents run on the PR branch from review on, so its risky files are checked before they do
 
 const RISKY_PR = { files: ['AGENTS.md', 'docs/setup.md'] };
-const CLEAN = { blocking: 0, at: '2026-11-09T11:20:00Z' };
+const CLEAN = rv(0);
 
 test('green CI on a PR changing risky files waits for approval before the reviewer runs', () => {
-  const a = finished(snap(st('ci', { pr: 51 }), { pr: pr(RISKY_PR) }), run('ci'));
+  const a = finished(snap(st('ci', { pr: 51 }), { pr: pr(RISKY_PR) }), run('verify'));
   assert.deepEqual(stages(a), ['awaiting-approval']);
   assert.deepEqual(dispatches(a), []);
   const s = saves(a)[0];
@@ -518,7 +530,7 @@ test('green CI on a PR changing risky files waits for approval before the review
 });
 
 test('red CI on a PR changing risky files waits for approval before the fixer runs', () => {
-  const a = finished(snap(st('ci', { pr: 51, round: 1 }), { pr: pr(RISKY_PR) }), run('ci', 'failure'));
+  const a = finished(snap(st('ci', { pr: 51, round: 1 }), { pr: pr(RISKY_PR) }), run('verify', 'failure'));
   assert.deepEqual(stages(a), ['awaiting-approval']);
   assert.deepEqual(dispatches(a), []);
   const s = saves(a)[0];
@@ -528,7 +540,7 @@ test('red CI on a PR changing risky files waits for approval before the fixer ru
 });
 
 test('a blocking review on a risky diff waits for approval before the fixer runs', () => {
-  const a = finished(snap(st('in-review', { pr: 51 }), { pr: pr(RISKY_PR), review: { blocking: 1, at: '2026-11-09T11:20:00Z' } }), run('review'));
+  const a = finished(snap(st('in-review', { pr: 51 }), { pr: pr(RISKY_PR), review: rv(1) }), run('review'));
   assert.deepEqual(stages(a), ['awaiting-approval']);
   assert.equal(saves(a)[0]?.afterApproval, 'fix');
   assert.equal(saves(a)[0]?.fixReason, 'review');
@@ -567,7 +579,7 @@ test('/approve on a gated diff continues into the fixer with the stored reason a
 });
 
 test('/approve on a gated diff bound for ready marks the PR ready', () => {
-  const a = cmd(snap(gated({ afterApproval: 'ready' }), { pr: pr(RISKY_PR) }), 'approve');
+  const a = cmd(snap(gated({ afterApproval: 'ready' }), { pr: pr(RISKY_PR), review: rv(0) }), 'approve');
   assert.deepEqual(stages(a), ['ready']);
   assert.ok(a.some((x) => x.kind === 'pr-ready' && x.pr === 51));
 });
@@ -591,11 +603,11 @@ test('an approved head skips the gate until the next push', () => {
   const pushed = snap(st('in-review', { pr: 51, approvedSha: 'sha-0' }), { pr: pr(RISKY_PR), review: CLEAN });
   assert.deepEqual(stages(finished(pushed, run('review'))), ['awaiting-approval']);
   const ci = snap(st('ci', { pr: 51, approvedSha: 'sha-1' }), { pr: pr(RISKY_PR) });
-  assert.deepEqual(stages(finished(ci, run('ci'))), ['in-review']);
+  assert.deepEqual(stages(finished(ci, run('verify'))), ['in-review']);
 });
 
 test('/approve on a plan records the brief\'s Touches; a different brief records none', () => {
-  const brief = { id: 900, touches: ['plugin/hooks', 'docs/x.md'], at: '2026-11-09T11:20:00Z' };
+  const brief = { id: 900, touches: ['plugin/hooks', 'docs/x.md'], at: '2026-11-09T11:20:00Z', attempt: A };
   const a = cmd(snap(st('awaiting-approval', { approvalFor: 'plan', brief: 900 }), { brief }), 'approve');
   assert.deepEqual(saves(a)[0]?.approvedTouches, ['plugin/hooks', 'docs/x.md']);
   const other = cmd(snap(st('awaiting-approval', { approvalFor: 'plan', brief: 900 }), { brief: { ...brief, id: 901 } }), 'approve');
@@ -607,11 +619,11 @@ test('/approve on a plan records the brief\'s Touches; a different brief records
 test('a diff inside the approved Touches needs no second approval; anything outside them does', () => {
   const plan = { approvedTouches: ['plugin/hooks'] };
   const inside = snap(st('ci', { pr: 51, ...plan }), { pr: pr({ files: ['plugin/hooks/gates.ts', 'docs/x.md'] }) });
-  assert.deepEqual(stages(finished(inside, run('ci'))), ['in-review']);
+  assert.deepEqual(stages(finished(inside, run('verify'))), ['in-review']);
   const ready = snap(st('in-review', { pr: 51, ...plan }), { pr: pr({ files: ['plugin/hooks/gates.ts'] }), review: CLEAN });
   assert.deepEqual(stages(finished(ready, run('review'))), ['ready']);
   const outside = snap(st('ci', { pr: 51, ...plan }), { pr: pr({ files: ['plugin/hooks/gates.ts', 'AGENTS.md'] }) });
-  const a = finished(outside, run('ci'));
+  const a = finished(outside, run('verify'));
   assert.deepEqual(stages(a), ['awaiting-approval']);
   assert.match(comments(a)[0] ?? '', /`AGENTS.md`/);
   assert.doesNotMatch(comments(a)[0] ?? '', /gates.ts/);
@@ -643,7 +655,7 @@ test('retrying the fixer or the reviewer on a risky diff waits for approval', ()
 // The CI run the fixer reads
 
 test('the router records the CI run it acted on', () => {
-  const red = run('ci', 'failure', { url: 'https://github.com/o/r/actions/runs/41' });
+  const red = run('verify', 'failure', { url: 'https://github.com/o/r/actions/runs/41' });
   assert.equal(saves(finished(snap(st('ci', { pr: 51 }), { pr: pr() }), red))[0]?.ciRun, red.url);
   assert.equal(saves(finished(snap(st('ci', { pr: 51, round: 3 }), { pr: pr() }), red))[0]?.ciRun, red.url);
   // A failed fixer run does not replace it: the retried fixer still needs the CI log.
@@ -711,10 +723,10 @@ test('the sweep does not finish a re-queued issue on the closed PR of its earlie
 // The head the router let through: the stage refuses to run on any other
 
 test('dispatching the reviewer or the fixer records the PR head the diff gate checked', () => {
-  const green = finished(snap(st('ci', { pr: 51 }), { pr: pr({ headSha: 'sha-9' }) }), run('ci', 'success', { headSha: 'sha-9' }));
+  const green = finished(snap(st('ci', { pr: 51, gatedSha: 'sha-9' }), { pr: pr({ headSha: 'sha-9' }) }), run('verify'));
   assert.deepEqual(dispatches(green), ['review']);
   assert.equal(saves(green)[0]?.gatedSha, 'sha-9');
-  const red = finished(snap(st('ci', { pr: 51 }), { pr: pr({ headSha: 'sha-9' }) }), run('ci', 'failure', { headSha: 'sha-9' }));
+  const red = finished(snap(st('ci', { pr: 51, gatedSha: 'sha-9' }), { pr: pr({ headSha: 'sha-9' }) }), run('verify', 'failure'));
   assert.deepEqual(dispatches(red), ['fix']);
   assert.equal(saves(red)[0]?.gatedSha, 'sha-9');
   const approved = cmd(snap(gated({ afterApproval: 'review' }), { pr: pr(RISKY_PR) }), 'approve');
@@ -747,4 +759,211 @@ test('without a PR the reviewer and the fixer are not dispatched; the issue bloc
     assert.equal(saves(a)[0]?.blockedFor, 'no-pr');
     assert.match(comments(a)[0] ?? '', /PR/);
   }
+});
+
+// --- Roles ---------------------------------------------------------------------------------------------------------
+
+test('queueing records who queued; only the queue role can queue', () => {
+  const a = decideEvent({ kind: 'queued', issue: 7, actor: 'alice' }, snap(null), ctx);
+  assert.equal(saves(a)[0]?.queuedBy, 'alice');
+  assert.deepEqual(decideEvent({ kind: 'queued', issue: 7, actor: 'mallory' }, snap(null), ctx), []);
+});
+
+test('the queue role can /stop and /retry but not /approve', () => {
+  const waiting = snap(st('awaiting-approval', { approvalFor: 'plan', brief: 900 }), { brief: BRIEF });
+  assert.deepEqual(cmd(waiting, 'approve', 'alice'), [], 'alice may queue, not approve');
+  assert.deepEqual(stages(cmd(waiting, 'approve', 'adamwardecki')), ['building']);
+  assert.deepEqual(stages(cmd(snap(st('building')), 'stop', 'alice')), ['blocked']);
+  assert.deepEqual(stages(cmd(snap(st('blocked', { blockedFrom: 'planning', blockedFor: 'stop' })), 'retry', 'alice')), ['planning']);
+  // The sweep applies the same rule to a command it recovers.
+  const missed = snap(st('awaiting-approval', { approvalFor: 'plan', brief: 900 }), { brief: BRIEF, lastCommand: { command: 'approve', at: '2026-11-09T11:30:00Z', actor: 'alice' } });
+  assert.deepEqual(sweep([missed], ctx), []);
+});
+
+test('a ready PR asks whoever queued it to review, then the fallback', () => {
+  const s = snap(st('in-review', { pr: 51, queuedBy: 'alice' }), { pr: pr(), review: rv(0) });
+  assert.ok(finished(s, run('review')).some((x) => x.kind === 'pr-ready' && x.pr === 51 && x.reviewer === 'alice'));
+  const b = finished(snap(st('in-review', { pr: 51 }), { pr: pr(), review: rv(0) }), run('review'));
+  assert.ok(b.some((x) => x.kind === 'pr-ready' && x.reviewer === 'adamwardecki'));
+});
+
+test('limits come from the repo config', () => {
+  const tight: Ctx = { ...ctx, limits: { ...ctx.limits, maxRounds: 1 } };
+  const a = decideEvent({ kind: 'run-finished', issue: 7, run: run('verify', 'failure') }, snap(st('ci', { pr: 51, round: 1 }), { pr: pr() }), tight);
+  assert.deepEqual(stages(a), ['blocked']);
+});
+
+// --- Attempts ------------------------------------------------------------------------------------------------------
+
+const attempts = (a: Action[]) => a.flatMap((x) => (x.kind === 'dispatch' ? [x.attempt] : []));
+const cancels = (a: Action[]) => a.flatMap((x) => (x.kind === 'cancel' ? [`${x.workflow} ${x.attempt}`] : []));
+
+test('every entry into a stage with a workflow gets a new attempt, and the dispatch carries it', () => {
+  const a = finished(snap(st('planning'), { brief: BRIEF, labels: ['ready-for-agent'] }), run('plan'));
+  const attempt = saves(a)[0]?.attempt;
+  assert.ok(attempt && attempt !== A);
+  assert.deepEqual(attempts(a), [attempt]);
+  // A stage that waits on a person has no attempt.
+  const waiting = finished(snap(st('planning'), { brief: { ...BRIEF, touches: ['plugin/hooks/x.ts'] }, labels: ['ready-for-agent'] }), run('plan'));
+  assert.equal(saves(waiting)[0]?.attempt, undefined);
+});
+
+test('/stop cancels the run of the attempt it stops', () => {
+  const a = cmd(snap(st('building')), 'stop');
+  assert.deepEqual(stages(a), ['blocked']);
+  assert.deepEqual(cancels(a), [`build ${A}`]);
+  assert.deepEqual(cancels(cmd(snap(st('ready', { pr: 51 }), { pr: pr() }), 'stop')), [], 'nothing runs while an issue waits on a person');
+});
+
+test('a build whose PR was signed for another attempt is not this build', () => {
+  const stale = finished(snap(st('building'), { pr: pr({ attempt: 'old' }) }), run('build'));
+  assert.equal(saves(stale)[0]?.attempts, 1);
+  assert.deepEqual(dispatches(stale), []);
+  const unsigned = finished(snap(st('building'), { pr: pr({ signed: false, attempt: null }) }), run('build'));
+  assert.equal(saves(unsigned)[0]?.attempts, 1);
+});
+
+// --- Verify and the SHAs -------------------------------------------------------------------------------------------
+
+test('a build with a risky diff waits for approval before verify runs anything on it', () => {
+  const a = finished(snap(st('building'), { pr: pr({ files: ['plugin/hooks/gates.ts'] }) }), run('build'));
+  assert.deepEqual(stages(a), ['awaiting-approval']);
+  assert.equal(saves(a)[0]?.afterApproval, 'verify');
+  assert.deepEqual(dispatches(a), []);
+  const approved = cmd(snap(saves(a)[0] ?? null, { pr: pr({ files: ['plugin/hooks/gates.ts'] }) }), 'approve');
+  assert.deepEqual(dispatches(approved), ['verify']);
+});
+
+test('a verify run that broke before its checks finished is a failed attempt, not a fix round', () => {
+  const a = finished(snap(st('ci', { pr: 51 }), { pr: pr() }), run('verify', 'startup_failure'));
+  assert.deepEqual(stages(a), ['ci']);
+  assert.equal(saves(a)[0]?.attempts, 1);
+  assert.deepEqual(dispatches(a), []);
+});
+
+test('a fix that pushed goes back through verify, not straight to review', () => {
+  const a = finished(snap(st('fixing', { pr: 51, headSha: 'sha-0' }), { pr: pr() }), run('fix'));
+  assert.deepEqual(dispatches(a), ['verify']);
+  assert.equal(saves(a)[0]?.gatedSha, HEAD);
+});
+
+test('the head changed during review: the old review cannot make the new head ready', () => {
+  // Verify passed and the reviewer read sha-1; someone pushed sha-2 while it ran.
+  const s = snap(st('in-review', { pr: 51 }), { pr: pr({ headSha: 'sha-2' }), review: rv(0) });
+  const a = finished(s, run('review'));
+  assert.deepEqual(stages(a), ['ci'], 'the new head goes back through verify');
+  assert.deepEqual(dispatches(a), ['verify']);
+  assert.equal(saves(a)[0]?.gatedSha, 'sha-2');
+  assert.ok(!a.some((x) => x.kind === 'pr-ready'));
+  // Once verify passes on sha-2, the review of sha-1 still doesn't count: the reviewer runs again.
+  const verified = snap(saves(a)[0] ?? null, { pr: pr({ headSha: 'sha-2' }), review: rv(0) });
+  const b = finished(verified, run('verify', 'success', { attempt: saves(a)[0]?.attempt ?? null }));
+  assert.deepEqual(dispatches(b), ['review']);
+  assert.equal(saves(b)[0]?.verifiedSha, 'sha-2');
+});
+
+test('ready needs the head, the review and verify to name the same commit', () => {
+  const approve = (extra: Partial<FactoryState>, review: IssueSnapshot['review']) =>
+    cmd(snap(st('awaiting-approval', { approvalFor: 'diff', afterApproval: 'ready', pr: 51, ...extra }), { pr: pr(), review }), 'approve');
+  assert.deepEqual(stages(approve({}, rv(0))), ['ready']);
+  assert.deepEqual(dispatches(approve({ verifiedSha: 'sha-0' }, rv(0))), ['verify'], 'verify passed on another commit');
+  assert.deepEqual(dispatches(approve({}, rv(0, { sha: 'sha-0' }))), ['review'], 'the review is of another commit');
+  assert.deepEqual(dispatches(approve({}, null)), ['review']);
+});
+
+// --- Admission -----------------------------------------------------------------------------------------------------
+
+const at = (n: number, s: IssueSnapshot): IssueSnapshot => ({ ...s, number: n });
+const savedStages = (a: Action[]) => a.flatMap((x) => (x.kind === 'save' ? [`${x.issue}:${x.state.stage}`] : []));
+
+test('/approve at capacity: the approved issue waits for a slot instead of starting a second active issue', () => {
+  const busy = at(2, snap(st('building')));
+  const approved = at(7, snap(st('awaiting-approval', { approvalFor: 'plan', brief: 900 }), { brief: BRIEF }));
+  const raw = decideEvent({ kind: 'command', issue: 7, command: 'approve', actor: 'adamwardecki' }, approved, ctx);
+  assert.deepEqual(dispatches(raw), ['build'], 'decideEvent alone would start it');
+  const a = settle([busy, approved], raw, ctx);
+  assert.deepEqual(savedStages(a), ['7:waiting']);
+  assert.equal(saves(a)[0]?.resume, 'build');
+  assert.equal(saves(a)[0]?.attempt, undefined);
+  assert.deepEqual(saves(a)[0]?.approvedTouches, BRIEF.touches, 'the approval is kept for when it starts');
+  assert.deepEqual(dispatches(a), []);
+  assert.deepEqual(next([busy, approved], ctx, a), [], 'and nothing else starts either');
+  // With a second slot it starts at once.
+  assert.deepEqual(dispatches(settle([busy, approved], raw, withActive(2))), ['build']);
+});
+
+test('/retry and a changes-requested review pass through the same queue', () => {
+  const busy = at(2, snap(st('in-review', { pr: 50 })));
+  const blocked = at(7, snap(st('blocked', { blockedFrom: 'planning', blockedFor: 'stop' })));
+  const retried = settle([busy, blocked], decideEvent({ kind: 'command', issue: 7, command: 'retry', actor: 'adamwardecki' }, blocked, ctx), ctx);
+  assert.deepEqual(savedStages(retried), ['7:waiting']);
+  assert.equal(saves(retried)[0]?.resume, 'plan');
+  const ready = at(8, snap(st('ready', { pr: 51 }), { pr: pr() }));
+  const asked = settle([busy, ready], decideEvent({ kind: 'changes-requested', issue: 8, actor: 'adamwardecki' }, ready, ctx), ctx);
+  assert.deepEqual(savedStages(asked), ['8:waiting']);
+  assert.equal(saves(asked)[0]?.resume, 'fix');
+  assert.equal(saves(asked)[0]?.fixReason, 'maintainer');
+});
+
+test('an issue that stays active keeps its slot, and one that leaves frees it', () => {
+  const building = at(2, snap(st('building'), { pr: pr() }));
+  const moves = decideEvent({ kind: 'run-finished', issue: 2, run: run('build') }, building, ctx);
+  assert.deepEqual(dispatches(settle([building], moves, ctx)), ['verify'], 'building to ci is not a new admission');
+  const queued = at(3, snap(st('queued')));
+  const stopped = settle([building, queued], decideEvent({ kind: 'command', issue: 2, command: 'stop', actor: 'adamwardecki' }, building, ctx), ctx);
+  assert.deepEqual(savedStages(next([building, queued], ctx, stopped)), ['3:planning'], 'the stop freed the slot');
+});
+
+test('a free slot goes to waiting issues first, oldest first, then rebases, then queued issues', () => {
+  const waitingOld = at(4, snap(st('waiting', { resume: 'build', since: '2026-11-09T09:00:00Z' })));
+  const waitingNew = at(5, snap(st('waiting', { resume: 'plan', since: '2026-11-09T10:00:00Z' })));
+  const conflicting = at(6, snap(st('ready', { pr: 51 }), { pr: pr({ conflicting: true }) }));
+  const queued = at(3, snap(st('queued', { since: '2026-11-09T08:00:00Z' })));
+  const all = [queued, conflicting, waitingNew, waitingOld];
+  assert.deepEqual(savedStages(next(all, ctx)), ['4:building']);
+  assert.deepEqual(savedStages(next(all, withActive(2))), ['4:building', '5:planning']);
+  assert.deepEqual(savedStages(next(all, withActive(4))), ['4:building', '5:planning', '6:fixing', '3:planning']);
+});
+
+test('a waiting issue bound for the PR branch is checked again when its slot comes', () => {
+  const waiting = st('waiting', { resume: 'review', pr: 51 });
+  // The PR moved while it waited: verify first.
+  assert.deepEqual(dispatches(next([snap(waiting, { pr: pr({ headSha: 'sha-2' }) })], ctx)), ['verify']);
+  // The PR now has a risky diff: it asks for approval and takes no slot, so the queued issue starts.
+  const risky = at(7, snap(waiting, { pr: pr({ files: ['plugin/hooks/gates.ts'] }) }));
+  assert.deepEqual(savedStages(next([risky, at(3, snap(st('queued')))], ctx)), ['7:awaiting-approval', '3:planning']);
+  // The PR is gone: blocked.
+  assert.deepEqual(savedStages(next([at(7, snap(waiting))], ctx)), ['7:blocked']);
+});
+
+test('never more than maxActive issues are active after a sweep', () => {
+  const failedA = at(1, snap(st('planning', { attempts: 1, failedAt: '2026-11-09T10:30:00Z' })));
+  const approvedB = at(2, snap(st('awaiting-approval', { approvalFor: 'plan', brief: 900 }), { brief: BRIEF, lastCommand: { command: 'approve', at: '2026-11-09T11:30:00Z', actor: 'adamwardecki' } }));
+  const queuedC = at(3, snap(st('queued')));
+  for (const max of [1, 2, 3]) {
+    const a = sweep([failedA, approvedB, queuedC], withActive(max));
+    const after = new Map<number, Stage>([[1, 'planning'], [2, 'awaiting-approval'], [3, 'queued']]);
+    for (const x of a) if (x.kind === 'save') after.set(x.issue, x.state.stage);
+    const active = [...after.values()].filter((s) => ['planning', 'building', 'ci', 'in-review', 'fixing'].includes(s)).length;
+    assert.equal(active, max, `maxActive ${max}`);
+    assert.equal(dispatches(a).length, max, 'every active issue has a run, and no parked one does');
+  }
+});
+
+test('a rebase that hits its cap leaves the slot for a queued issue', () => {
+  const capped = at(3, snap(st('ready', { pr: 51, rebases: 2, fixReason: 'rebase' }), { pr: pr({ conflicting: true }) }));
+  assert.deepEqual(savedStages(next([capped, at(5, snap(st('queued')))], ctx)), ['3:blocked', '5:planning']);
+});
+
+// --- Key rotation --------------------------------------------------------------------------------------------------
+
+test('state signed with a replaced key blocks the issue once; a fresh label starts it over', () => {
+  const lost = snap(null, { retiredKey: true, labels: ['agent:building'] });
+  const a = sweep([lost], ctx);
+  assert.deepEqual(stages(a), ['blocked']);
+  assert.equal(saves(a)[0]?.blockedFor, 'key-rotated');
+  assert.match(comments(a)[0] ?? '', /agent:queued/);
+  assert.deepEqual(cmd(snap(saves(a)[0] ?? null), 'retry'), [], '/retry cannot recover state that was lost');
+  const requeued = snap(null, { retiredKey: true, labels: ['agent:queued'], queuedBy: { login: 'alice', at: '2026-11-09T11:50:00Z' } });
+  assert.deepEqual(stages(sweep([requeued], ctx)), ['queued', 'planning']);
 });

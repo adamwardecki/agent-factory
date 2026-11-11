@@ -1,9 +1,10 @@
 // A thin GitHub REST and GraphQL client for the factory. No retries: the sweep runs every 30 minutes and picks up
-// whatever a failed run left behind.
+// whatever a failed run left behind. Every write the factory makes goes through a function here, with the client it
+// was handed: nothing in this file knows which identity the token belongs to.
 
-import { branchFor, CI_WORKFLOW_FILE, LABEL_PREFIX, runTitle, type StageWorkflow, stageWorkflowFile } from './config.ts';
-import type { PullSnapshot, RunSnapshot } from './decide.ts';
-import { dig, inRepo, isCiRun, isStageRun, num, rows, runFrom, str } from './json.ts';
+import { branchFor, LABEL_PREFIX, type RunWorkflow, runTitle, STAGE_WORKFLOW_FILE } from './config.ts';
+import type { PullSnapshot } from './decide.ts';
+import { dig, inRepo, isStageRun, num, rows, str } from './json.ts';
 
 export type Gh = { repo: string; call: (method: string, path: string, body?: unknown) => Promise<unknown> };
 // nodeId is the GraphQL id, for looking up who last edited the comment or review (commentEditors).
@@ -108,7 +109,15 @@ export async function pullBranch(gh: Gh, pr: number): Promise<string | null> {
   return inRepo(dig(p, 'head', 'repo'), gh.repo) ? str(dig(p, 'head', 'ref')) : null;
 }
 
-export async function pullSnapshot(gh: Gh, pr: number): Promise<PullSnapshot & { nodeId: string }> {
+// An open PR from the issue's factory branch in this repo: the one a build updates rather than opening a second.
+export async function findOpenPull(gh: Gh, issue: number): Promise<number | null> {
+  const owner = gh.repo.split('/')[0] ?? '';
+  const list = rows(await gh.call('GET', `/repos/${gh.repo}/pulls?state=open&head=${owner}:${encodeURIComponent(branchFor(issue))}&per_page=10`));
+  return num(dig(list.find((p) => inRepo(dig(p, 'head', 'repo'), gh.repo)), 'number'));
+}
+
+// signed and attempt come from the body's signed footer, which snapshot.ts checks.
+export async function pullSnapshot(gh: Gh, pr: number): Promise<Omit<PullSnapshot, 'signed' | 'attempt'> & { nodeId: string; body: string }> {
   const p = await gh.call('GET', `/repos/${gh.repo}/pulls/${pr}`);
   // A rename lists its old path too: moving a file out of a risky directory changes that directory.
   const files = (await paged(gh, `/repos/${gh.repo}/pulls/${pr}/files`)).flatMap((f) => {
@@ -123,21 +132,72 @@ export async function pullSnapshot(gh: Gh, pr: number): Promise<PullSnapshot & {
     conflicting: dig(p, 'mergeable_state') === 'dirty',
     files,
     nodeId: str(dig(p, 'node_id')),
+    body: str(dig(p, 'body')),
   };
 }
 
-// Checked as events.ts checks a workflow_run event, so the sweep cannot pick a run the event path would ignore.
-export async function latestStageRun(gh: Gh, workflow: StageWorkflow, issue: number): Promise<RunSnapshot | null> {
-  const runs = rows(dig(await gh.call('GET', `/repos/${gh.repo}/actions/workflows/${stageWorkflowFile(workflow)}/runs?event=workflow_dispatch&per_page=30`), 'workflow_runs'));
-  const r = runs.find((x) => dig(x, 'display_title') === runTitle(workflow, issue) && isStageRun(x, workflow, gh.repo));
-  return r ? runFrom(r, workflow) : null;
+// The stage run the router dispatched for this attempt, as the API returns it; null before GitHub has created it.
+// The title names the attempt, and isStageRun checks what a title can't prove: this repo, a dispatch, the stage file.
+export async function findRun(gh: Gh, workflow: RunWorkflow, issue: number, attempt: string): Promise<unknown> {
+  const runs = rows(dig(await gh.call('GET', `/repos/${gh.repo}/actions/workflows/${STAGE_WORKFLOW_FILE}/runs?event=workflow_dispatch&per_page=50`), 'workflow_runs'));
+  return runs.find((x) => dig(x, 'display_title') === runTitle(workflow, issue, attempt) && isStageRun(x, gh.repo)) ?? null;
 }
 
-// A fork can push the same commit, and its PR's CI run then has the same head sha.
-export async function latestCiRun(gh: Gh, issue: number, headSha: string): Promise<RunSnapshot | null> {
-  const runs = rows(dig(await gh.call('GET', `/repos/${gh.repo}/actions/workflows/${CI_WORKFLOW_FILE}/runs?head_sha=${headSha}&per_page=20`), 'workflow_runs'));
-  const r = runs.find((x) => isCiRun(x, gh.repo) && dig(x, 'head_branch') === branchFor(issue));
-  return r ? runFrom(r, 'ci') : null;
+export async function getRun(gh: Gh, id: number): Promise<unknown> {
+  return gh.call('GET', `/repos/${gh.repo}/actions/runs/${id}`);
+}
+
+export type Job = { name: string; conclusion: string | null; status: string };
+export async function runJobs(gh: Gh, id: number): Promise<Job[]> {
+  return rows(dig(await gh.call('GET', `/repos/${gh.repo}/actions/runs/${id}/jobs?per_page=100`), 'jobs')).map((j) => ({
+    name: str(dig(j, 'name')),
+    conclusion: str(dig(j, 'conclusion')) || null,
+    status: str(dig(j, 'status')),
+  }));
+}
+
+// A run that already finished can't be cancelled (409); that is what the caller wanted anyway.
+export async function cancelRun(gh: Gh, id: number): Promise<void> {
+  try {
+    await gh.call('POST', `/repos/${gh.repo}/actions/runs/${id}/cancel`);
+  } catch (err) {
+    if (!(err instanceof GitHubError && err.status === 409)) throw err;
+  }
+}
+
+export async function defaultBranch(gh: Gh): Promise<string> {
+  return str(dig(await gh.call('GET', `/repos/${gh.repo}`), 'default_branch'));
+}
+
+// The commit a branch points at; null when the branch doesn't exist.
+export async function branchHead(gh: Gh, branch: string): Promise<string | null> {
+  try {
+    return str(dig(await gh.call('GET', `/repos/${gh.repo}/git/ref/heads/${branch}`), 'object', 'sha')) || null;
+  } catch (err) {
+    if (err instanceof GitHubError && err.status === 404) return null;
+    throw err;
+  }
+}
+
+// A file on a given ref, decoded; null when it doesn't exist.
+export async function readRepoFile(gh: Gh, path: string, ref: string): Promise<string | null> {
+  try {
+    const r = await gh.call('GET', `/repos/${gh.repo}/contents/${path}?ref=${encodeURIComponent(ref)}`);
+    return Buffer.from(str(dig(r, 'content')), 'base64').toString('utf8');
+  } catch (err) {
+    if (err instanceof GitHubError && err.status === 404) return null;
+    throw err;
+  }
+}
+
+// The login's role on the repo (read, triage, write, maintain, admin), or null without access.
+export async function collaboratorRole(gh: Gh, login: string): Promise<string | null> {
+  try {
+    return str(dig(await gh.call('GET', `/repos/${gh.repo}/collaborators/${encodeURIComponent(login)}/permission`), 'role_name')) || null;
+  } catch (err) {
+    if (err instanceof GitHubError && err.status === 404) return null;
+    throw err;
+  }
 }
 
 export type Edit = { editor: string | null; lastEditedAt: string | null };
@@ -146,8 +206,8 @@ export type Edit = { editor: string | null; lastEditedAt: string | null };
 const EDITABLE = ['IssueComment', 'PullRequestReview', 'PullRequestReviewComment'];
 const EDITORS_QUERY = 'query($ids: [ID!]!) { nodes(ids: $ids) { __typename id ... on Comment { editor { login __typename } lastEditedAt } } }';
 
-// Who last edited each comment, by node id. REST shows only the author, and anyone with write access (the factory's
-// App included) can edit a comment. GraphQL names a bot without the "[bot]" REST adds, so it is added back here. Ids
+// Who last edited each comment, by node id. REST shows only the author, and anyone with write access can
+// edit a comment. GraphQL names a bot without the "[bot]" REST adds, so it is added back here. Ids
 // that were not found are missing from the map: callers treat them as edited by someone unknown.
 export async function commentEditors(gh: Gh, nodeIds: readonly string[]): Promise<Map<string, Edit>> {
   const ids = [...new Set(nodeIds.filter((id) => id !== ''))];
@@ -197,8 +257,22 @@ export async function setStageLabel(gh: Gh, issue: number, have: readonly string
   return [...have.filter((x) => !x.startsWith(LABEL_PREFIX)), ...(want ? [want] : [])];
 }
 
-export async function dispatch(gh: Gh, workflow: StageWorkflow, issue: number): Promise<void> {
-  await gh.call('POST', `/repos/${gh.repo}/actions/workflows/${stageWorkflowFile(workflow)}/dispatches`, { ref: 'main', inputs: { issue: String(issue) } });
+// ref is the default branch: the caller workflow, and so the factory code it pins, always comes from there.
+export async function dispatchStage(gh: Gh, workflow: RunWorkflow, issue: number, attempt: string, ref: string): Promise<void> {
+  await gh.call('POST', `/repos/${gh.repo}/actions/workflows/${STAGE_WORKFLOW_FILE}/dispatches`, { ref, inputs: { stage: workflow, issue: String(issue), attempt } });
+}
+
+export async function createPull(gh: Gh, p: { title: string; body: string; head: string; base: string }): Promise<number | null> {
+  return num(dig(await gh.call('POST', `/repos/${gh.repo}/pulls`, { ...p, draft: true }), 'number'));
+}
+
+export async function updatePull(gh: Gh, pr: number, p: { title: string; body: string }): Promise<void> {
+  await gh.call('PATCH', `/repos/${gh.repo}/pulls/${pr}`, p);
+}
+
+// commit_id ties the review to the commit the reviewer read, whatever the PR head is by now.
+export async function postReview(gh: Gh, pr: number, body: string, commitId: string): Promise<void> {
+  await gh.call('POST', `/repos/${gh.repo}/pulls/${pr}/reviews`, { event: 'COMMENT', body, commit_id: commitId });
 }
 
 export async function markReady(gh: Gh, nodeId: string): Promise<void> {

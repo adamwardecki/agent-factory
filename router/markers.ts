@@ -1,22 +1,23 @@
 // The text formats the factory reads back from GitHub: the router's state comment, the planner's brief, the
 // reviewer's verdict and the maintainer's slash commands.
 
-import { STAGES, type Stage } from './config.ts';
+import { ATTEMPT, RUN_WORKFLOWS, type RunWorkflow, STAGES, STATE_VERSION, type Stage } from './config.ts';
 import { isRecord, oneOf } from './util.ts';
 
 export const FIX_REASONS = ['ci', 'review', 'maintainer', 'rebase'] as const;
 export type FixReason = (typeof FIX_REASONS)[number];
 
 // Why an issue is blocked; /retry picks its way back in from this. 'human' is a planner that asked for one; 'no-pr'
-// is a review or fix round with no PR whose diff the gate could check.
-export const BLOCK_REASONS = ['rounds', 'rebases', 'attempts', 'stuck', 'stop', 'human', 'no-pr'] as const;
+// is a verify, review or fix round with no PR whose diff the gate could check; 'key-rotated' is state signed with a
+// signing key that was replaced, which only a fresh agent:queued label restarts.
+export const BLOCK_REASONS = ['rounds', 'rebases', 'attempts', 'stuck', 'stop', 'human', 'no-pr', 'key-rotated'] as const;
 export type BlockReason = (typeof BLOCK_REASONS)[number];
 
 export const COMMANDS = ['approve', 'stop', 'retry'] as const;
 export type Command = (typeof COMMANDS)[number];
 
-// Where an issue goes once the maintainer approves a risky diff: the stage the diff gate stopped it from entering.
-export const AFTER_APPROVAL = ['review', 'fix', 'ready'] as const;
+// Where an issue goes once a risky diff is approved: what the diff gate stopped it from entering.
+export const AFTER_APPROVAL = ['verify', 'review', 'fix', 'ready'] as const;
 export type AfterApproval = (typeof AFTER_APPROVAL)[number];
 
 export type FactoryState = {
@@ -39,6 +40,10 @@ export type FactoryState = {
   headSha?: string; // PR head when the fixer was dispatched; unchanged after it means it pushed nothing
   gatedSha?: string; // PR head the diff gate checked when it let review or fix run; the stage runs on no other
   fixReason?: FixReason;
+  queuedBy?: string; // who added agent:queued; asked to review when the PR is ready
+  attempt?: string; // id of the current entry into a stage that runs a workflow; only this attempt may publish
+  verifiedSha?: string; // PR head the verify stage last passed on; review and ready need the head to be this one
+  resume?: RunWorkflow; // for a waiting issue: the workflow it was about to run when no slot was free
   runs: string[];
 };
 
@@ -62,7 +67,7 @@ export function renderState(s: FactoryState): string {
   const pr = s.pr ? ` · PR #${s.pr}` : '';
   const runs = s.runs.length ? `\n\nRuns: ${s.runs.map((u, i) => `[${i + 1}](${u})`).join(' ')}` : '';
   // Escape < and > so a field holding `-->` cannot end the comment early and leave the rest as visible text.
-  const data = JSON.stringify(s).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
+  const data = JSON.stringify({ v: STATE_VERSION, ...s }).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
   return `<!-- factory:state ${data} -->\nFactory: **${s.stage}**${pr} · fix round ${s.round}${runs}`;
 }
 
@@ -72,9 +77,19 @@ const id = (v: unknown): v is number => count(v) && v > 0;
 // An empty head would match a PR snapshot whose head failed to load, and skip the diff gate.
 const sha = (v: unknown): v is string => typeof v === 'string' && v !== '';
 const isTime = (v: unknown): v is string => typeof v === 'string' && !Number.isNaN(Date.parse(v));
+const attempt = (v: unknown): v is string => typeof v === 'string' && ATTEMPT.test(v);
+
+// The version a state comment was written with: 1 when it names none. null when the body is not a state comment.
+export function stateVersion(body: string): number | null {
+  const v = json(STATE_RE, body);
+  if (!isRecord(v)) return null;
+  return count(v.v) && v.v > 0 ? v.v : 1;
+}
 
 export function parseState(body: string): FactoryState | null {
   const v = json(STATE_RE, body);
+  // A state written by a newer release may mean something this one doesn't know; the router leaves it alone.
+  if (isRecord(v) && count(v.v) && v.v > STATE_VERSION) return null;
   // Every age check reads since; one that does not parse would leave the issue never retried and never stuck.
   if (!isRecord(v) || !oneOf(STAGES, v.stage) || !isTime(v.since)) return null;
   if (!count(v.round) || !count(v.attempts) || !Array.isArray(v.runs)) return null;
@@ -100,11 +115,17 @@ export function parseState(body: string): FactoryState | null {
   if (typeof v.headSha === 'string') s.headSha = v.headSha;
   if (sha(v.gatedSha)) s.gatedSha = v.gatedSha;
   if (oneOf(FIX_REASONS, v.fixReason)) s.fixReason = v.fixReason;
+  if (typeof v.queuedBy === 'string' && v.queuedBy !== '') s.queuedBy = v.queuedBy;
+  if (attempt(v.attempt)) s.attempt = v.attempt;
+  if (sha(v.verifiedSha)) s.verifiedSha = v.verifiedSha;
+  if (oneOf(RUN_WORKFLOWS, v.resume)) s.resume = v.resume;
   return s;
 }
 
 const TOUCHES = '**touches:**';
-const SECTION_END = /^\s*(?:#|\*\*[^*]+:\*\*)/;
+// The attempt and signature lines the publish job adds after the brief end the section too. Agent text can't
+// contain them: the publish job refuses it.
+const SECTION_END = /^\s*(?:#|\*\*[^*]+:\*\*|<!-- factory:(?:attempt|sig) )/;
 const BULLET = /^\s*[-*]\s+(.*)$/;
 
 // The bulleted paths under "**Touches:**" in the brief's Factory block, up to the next heading or bold label. null
@@ -133,11 +154,34 @@ export function parseBriefTouches(body: string): string[] | null {
   return touches;
 }
 
-export function parseReview(body: string): { blocking: number; nits: number } | null {
+export type ReviewMarker = { blocking: number; nits: number; sha: string | null; attempt: string | null };
+
+// The reviewer writes the counts; the publish job adds the commit it reviewed and the attempt (stampReview).
+export function parseReview(body: string): ReviewMarker | null {
   const v = json(REVIEW_RE, body);
   if (!isRecord(v) || !count(v.blocking)) return null;
-  return { blocking: v.blocking, nits: count(v.nits) ? v.nits : 0 };
+  return { blocking: v.blocking, nits: count(v.nits) ? v.nits : 0, sha: sha(v.sha) ? v.sha : null, attempt: attempt(v.attempt) ? v.attempt : null };
 }
+
+// Rewrites the review's marker with the reviewed commit and the attempt. Whatever sha or attempt the agent wrote in
+// its own marker is dropped: only the publish job knows them.
+export function stampReview(body: string, reviewedSha: string, attemptId: string): string | null {
+  const r = parseReview(body);
+  if (!r) return null;
+  const marker = `<!-- factory:review ${JSON.stringify({ blocking: r.blocking, nits: r.nits, sha: reviewedSha, attempt: attemptId })} -->`;
+  return body.replace(REVIEW_RE, marker);
+}
+
+// The line the publish job puts at the end of everything else it posts (brief, planner note, PR body, fix comment),
+// just above the signature. It ties the text to the attempt that produced it.
+const ATTEMPT_LINE = /(?:^|\n)<!-- factory:attempt ([0-9a-z]{1,16}) -->[ \t\r\n]*(?:<!-- factory:sig [0-9a-f.]+ -->[ \t\r\n]*)?$/;
+export const withAttempt = (body: string, attemptId: string): string => `${body.replace(/\s+$/, '')}\n<!-- factory:attempt ${attemptId} -->`;
+export function attemptOf(body: string): string | null {
+  return ATTEMPT_LINE.exec(body.replace(/\r\n/g, '\n'))?.[1] ?? null;
+}
+
+// Agent-written text must not carry the factory's own markers: a forged one could pass for the publish job's.
+export const FORBIDDEN_MARKERS = ['factory:sig', 'factory:attempt', 'factory:state'] as const;
 
 export function parseCommand(body: string): Command | null {
   // The word must end at whitespace or the end of the comment: `\b` would read `/approve-not-yet` as an approval.

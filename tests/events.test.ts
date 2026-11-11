@@ -9,7 +9,7 @@ const parse = (name: string, payload: unknown) => parseEvent(name, payload, REPO
 
 function build(name: string, payload: unknown, issue = 7) {
   const parsed = parse(name, payload);
-  assert.ok(parsed && parsed !== 'sweep', `expected an event for ${name}`);
+  assert.ok(parsed && parsed !== 'sweep' && 'target' in parsed, `expected an event for ${name}`);
   return { target: parsed.target, event: parsed.build(issue) };
 }
 
@@ -52,65 +52,42 @@ test('a closed factory PR', () => {
   assert.equal(parse('pull_request_target', { action: 'closed', pull_request: { head: { ref: 'factory/issue-7', repo: ours } } }), null);
 });
 
-test('a finished CI run on a factory branch', () => {
-  const { target, event } = build('workflow_run', {
-    action: 'completed',
-    workflow_run: { name: 'CI', head_branch: 'factory/issue-7', head_repository: ours, head_sha: 'sha-1', html_url: 'https://example.test/r/1', conclusion: 'failure', status: 'completed', created_at: '2026-11-09T11:20:00Z', updated_at: '2026-11-09T11:30:00Z' },
-  });
-  assert.deepEqual(target, { issue: 7 });
-  assert.deepEqual(event, {
-    kind: 'run-finished',
-    issue: 7,
-    run: { workflow: 'ci', conclusion: 'failure', headSha: 'sha-1', url: 'https://example.test/r/1', createdAt: '2026-11-09T11:20:00Z', completedAt: '2026-11-09T11:30:00Z' },
-  });
-});
 
-test('a finished stage run is matched by its run-name', () => {
-  const { target, event } = build('workflow_run', {
-    action: 'completed',
-    workflow_run: { name: 'factory-review', display_title: 'factory-review #12', event: 'workflow_dispatch', path: '.github/workflows/factory-review.yml', head_repository: ours, head_sha: 'main-sha', html_url: 'https://example.test/r/2', conclusion: 'success', status: 'completed', updated_at: '2026-11-09T11:40:00Z' },
-  }, 12);
-  assert.deepEqual(target, { issue: 12 });
-  assert.equal(event.kind === 'run-finished' && event.run.workflow, 'review');
-  assert.equal(parse('workflow_run', { action: 'completed', workflow_run: { name: 'Pages', display_title: 'x' } }), null);
-});
 
 // Forged and foreign runs and PRs
 
 const stageRun = (extra: Record<string, unknown> = {}) => ({
   action: 'completed',
   workflow_run: {
-    name: 'factory-build',
-    display_title: 'factory-build #7',
+    name: 'factory-stage',
+    display_title: 'factory-build #7 mhs1abc',
     event: 'workflow_dispatch',
-    path: '.github/workflows/factory-build.yml',
+    path: '.github/workflows/factory-stage.yml',
     head_repository: ours,
-    head_sha: 'main-sha',
     html_url: 'https://github.com/o/r/actions/runs/5',
     conclusion: 'success',
     status: 'completed',
-    created_at: '2026-11-09T11:20:00Z',
     updated_at: '2026-11-09T11:40:00Z',
     ...extra,
   },
 });
 
-test('a stage run counts only when dispatched from this repo\'s own stage workflow', () => {
-  assert.equal(build('workflow_run', stageRun()).event.kind, 'run-finished');
-  // Any workflow can take a run-name like "factory-build #7"; a fork's pull_request run can too.
-  assert.equal(parse('workflow_run', stageRun({ head_repository: fork })), null);
-  assert.equal(parse('workflow_run', stageRun({ head_repository: null })), null);
-  assert.equal(parse('workflow_run', stageRun({ event: 'pull_request' })), null);
-  assert.equal(parse('workflow_run', stageRun({ path: '.github/workflows/other.yml' })), null);
-  assert.equal(parse('workflow_run', stageRun({ path: '.github/workflows/factory-review.yml' })), null);
+test('workflow_run events are ignored: they never fire for runs GITHUB_TOKEN dispatched', () => {
+  assert.equal(parse('workflow_run', stageRun()), null);
+  assert.equal(parse('workflow_run', { action: 'completed', workflow_run: { head_repository: fork } }), null);
 });
 
-test('a CI run counts only from a factory branch in this repo', () => {
-  const ci = (extra: Record<string, unknown>) => ({ action: 'completed', workflow_run: { name: 'CI', head_branch: 'factory/issue-7', head_repository: ours, status: 'completed', ...extra } });
-  assert.ok(parse('workflow_run', ci({})));
-  assert.equal(parse('workflow_run', ci({ head_repository: fork })), null);
-  assert.equal(parse('workflow_run', ci({ head_repository: undefined })), null);
-  assert.equal(parse('workflow_run', ci({ head_branch: 'main' })), null);
+test('a report dispatch carries the stage, issue, attempt, run and result', () => {
+  const inputs = { report_stage: 'verify', report_issue: '49', report_attempt: 'mhs1abc', report_run_id: '42870928742', report_result: 'failure' };
+  assert.deepEqual(parse('workflow_dispatch', { inputs }), { report: { workflow: 'verify', issue: 49, attempt: 'mhs1abc', runId: 42870928742, result: 'failure' } });
+});
+
+test('a malformed report is ignored, not treated as a sweep', () => {
+  const good = { report_stage: 'build', report_issue: '1', report_attempt: 'mhs1abc', report_run_id: '2', report_result: 'success' };
+  for (const bad of [{ report_stage: 'deploy' }, { report_issue: 'x' }, { report_result: 'maybe' }, { report_attempt: '' }, { report_attempt: 'a b' }]) {
+    assert.equal(parse('workflow_dispatch', { inputs: { ...good, ...bad } }), null, JSON.stringify(bad));
+  }
+  assert.equal(parse('workflow_dispatch', { inputs: {} }), 'sweep', 'a plain manual run');
 });
 
 test('reviews and closes on a fork\'s PR from a factory-named branch are ignored', () => {

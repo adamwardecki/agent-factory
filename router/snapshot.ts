@@ -1,138 +1,160 @@
-// Reads issues from GitHub into the snapshots decide.ts works on.
+// Reads issues from GitHub into the snapshots decide.ts works on. The factory's own comments (state, brief, review,
+// PR footer) count only with a valid signature; people's comments count only from someone with the role the comment
+// needs, and only if nobody without it edited them since.
 
-import { MAINTAINER, ROUTER_LOGIN, RUNNER_FOR, STAGES, stageLabel } from './config.ts';
-import type { IssueSnapshot } from './decide.ts';
+import { type Authority, COMMAND_ROLES, holdsAny, type Role } from './authority.ts';
+import { ROUTER_LOGIN, RUNNER_FOR, STAGES, STATE_VERSION, stageLabel } from './config.ts';
+import type { IssueSnapshot, RunSnapshot } from './decide.ts';
 import {
   type Comment,
   commentEditors,
   type Edit,
   findPull,
+  findRun,
   type Gh,
   issueLabels,
-  latestCiRun,
   latestLabeler,
-  latestStageRun,
   listComments,
   listReviews,
   openIssuesWithLabel,
   pullSnapshot,
   type Review,
+  runJobs,
 } from './github.ts';
-import { BRIEF_MARKER, type FactoryState, parseBriefTouches, parseCommand, parseReview, parseState } from './markers.ts';
+import { dig, num } from './json.ts';
+import { attemptOf, BRIEF_MARKER, type FactoryState, parseBriefTouches, parseCommand, parseReview, parseState, stateVersion } from './markers.ts';
+import { runSnapshot } from './report.ts';
+import { check, verify } from './sign.ts';
 
-export type Loaded = { snap: IssueSnapshot; stateCommentId: number | null; prNodeId: string | null };
+export type Trust = { key: string; authority: Authority };
+// newerState: the state comment was written by a later factory release. The router leaves such an issue alone.
+export type Loaded = { snap: IssueSnapshot; stateCommentId: number | null; prNodeId: string | null; newerState: boolean };
 export type Edits = ReadonlyMap<string, Edit>;
 
-// Authorship alone is not enough: anyone with write access, the factory's App included, can edit a comment. A
-// comment counts only if it was never edited or `editor` edited it last. One that was not looked up counts as edited.
-export function editedOnlyBy(c: { nodeId: string }, edits: Edits, editor: string | null): boolean {
-  const e = edits.get(c.nodeId);
-  if (!e) return false;
-  return e.lastEditedAt === null || (editor !== null && e.editor === editor);
-}
+export type FoundState = { found: { id: number; state: FactoryState } | null; retiredKey: boolean; newer: boolean };
 
-// The router's latest state comment, before its edits are checked (stateFrom checks them).
-export function stateCandidate(comments: readonly Comment[]): { comment: Comment; state: FactoryState } | null {
+// The newest state comment that verifies. A state comment signed with another key id means the signing key was
+// replaced: older comments were signed with that key too, so the state is gone, and the caller is told why.
+export function stateFrom(comments: readonly Comment[], issue: number, key: string): FoundState {
   for (let i = comments.length - 1; i >= 0; i--) {
     const c = comments[i];
     if (!c || c.author !== ROUTER_LOGIN) continue;
+    const version = stateVersion(c.body);
+    if (version === null) continue;
+    const sig = check(key, issue, 'state', c.body);
+    if (sig === 'retired-key') return { found: null, retiredKey: true, newer: false };
+    if (sig !== 'ok') continue;
+    if (version > STATE_VERSION) return { found: null, retiredKey: false, newer: true };
     const state = parseState(c.body);
-    if (state) return { comment: c, state };
+    if (state) return { found: { id: c.id, state }, retiredKey: false, newer: false };
+  }
+  return { found: null, retiredKey: false, newer: false };
+}
+
+export function briefComment(comments: readonly Comment[], issue: number, key: string): Comment | undefined {
+  return comments.findLast((c) => c.author === ROUTER_LOGIN && c.body.trimStart().startsWith(BRIEF_MARKER) && verify(key, issue, 'brief', c.body));
+}
+
+export function briefFrom(comments: readonly Comment[], issue: number, key: string): IssueSnapshot['brief'] {
+  const c = briefComment(comments, issue, key);
+  const touches = c ? parseBriefTouches(c.body) : null;
+  return c && touches ? { id: c.id, touches, at: c.at, attempt: attemptOf(c.body) } : null;
+}
+
+export function reviewFrom(reviews: readonly Review[], issue: number, key: string): IssueSnapshot['review'] {
+  const r = reviews.findLast((x) => x.author === ROUTER_LOGIN && parseReview(x.body) !== null && verify(key, issue, 'review', x.body));
+  const marker = r ? parseReview(r.body) : null;
+  return r && marker ? { blocking: marker.blocking, at: r.at, sha: marker.sha, attempt: marker.attempt } : null;
+}
+
+// GraphQL reports a bot editor without the [bot] suffix.
+const sameLogin = (a: string, b: string) => a.replace(/\[bot\]$/, '').toLowerCase() === b.replace(/\[bot\]$/, '').toLowerCase();
+
+// A person's comment counts if its author holds one of the roles and nobody edited it, or the author or someone
+// else with one of those roles did.
+export async function trusted(c: { nodeId: string; author: string }, roles: readonly Role[], edits: Edits, authority: Authority): Promise<boolean> {
+  if (!(await holdsAny(authority, roles, c.author))) return false;
+  const e = edits.get(c.nodeId);
+  if (!e) return false;
+  return e.lastEditedAt === null || (e.editor !== null && (sameLogin(e.editor, c.author) || (await holdsAny(authority, roles, e.editor))));
+}
+
+// The newest slash command from someone who may give it.
+export async function commandFrom(comments: readonly Comment[], edits: Edits, authority: Authority): Promise<IssueSnapshot['lastCommand']> {
+  const candidates = comments.filter((c) => parseCommand(c.body) !== null).sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  for (const c of candidates) {
+    const command = parseCommand(c.body);
+    if (command && (await trusted(c, COMMAND_ROLES[command], edits, authority))) return { command, at: c.at, actor: c.author };
   }
   return null;
 }
 
-// The router's latest state comment. Only comments by the router account count, so nobody can forge a stage; and
-// only as the router last wrote it. An older state comment does not stand in for a tampered one: it would be stale.
-export function stateFrom(comments: readonly Comment[], edits: Edits): { id: number; state: FactoryState } | null {
-  const found = stateCandidate(comments);
-  return found && editedOnlyBy(found.comment, edits, ROUTER_LOGIN) ? { id: found.comment.id, state: found.state } : null;
+export async function changesRequestedFrom(reviews: readonly Review[], authority: Authority): Promise<IssueSnapshot['lastChangesRequested']> {
+  const asked = reviews.filter((r) => r.state === 'CHANGES_REQUESTED').sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  for (const r of asked) if (await authority.check('queue', r.author)) return { at: r.at, actor: r.author };
+  return null;
 }
 
-const briefCandidate = (comments: readonly Comment[], bot: string) => comments.findLast((c) => c.author === bot && c.body.includes(BRIEF_MARKER));
-
-// The factory bot's latest brief, if it was never edited: the maintainer approves the Touches it was posted with.
-export function briefFrom(comments: readonly Comment[], bot: string, edits: Edits): IssueSnapshot['brief'] {
-  const c = briefCandidate(comments, bot);
-  const touches = c && editedOnlyBy(c, edits, null) ? parseBriefTouches(c.body) : null;
-  return c && touches ? { id: c.id, touches, at: c.at } : null;
+// The current attempt's run, if GitHub has created it. Its jobs are read only once it has finished.
+async function currentRun(gh: Gh, issue: number, state: FactoryState | null, now: Date): Promise<RunSnapshot | null> {
+  const workflow = state ? RUNNER_FOR[state.stage] : undefined;
+  if (!state?.attempt || !workflow) return null;
+  const run = await findRun(gh, workflow, issue, state.attempt);
+  const id = num(dig(run, 'id'));
+  if (!run || id === null) return null;
+  const s = runSnapshot(run, dig(run, 'status') === 'completed' ? await runJobs(gh, id) : [], gh.repo, now);
+  if (!s) return null;
+  return { workflow: s.workflow, attempt: s.attempt, conclusion: s.conclusion, url: s.url, completedAt: s.completedAt };
 }
 
-const commandComments = (comments: readonly Comment[]) => comments.filter((c) => c.author === MAINTAINER && parseCommand(c.body) !== null);
-
-// The maintainer's latest slash command, from comments only the maintainer has edited.
-export function commandFrom(comments: readonly Comment[], edits: Edits): IssueSnapshot['lastCommand'] {
-  const commands = commandComments(comments)
-    .filter((c) => editedOnlyBy(c, edits, MAINTAINER))
-    .flatMap((c) => {
-      const command = parseCommand(c.body);
-      return command ? [{ command, at: c.at, actor: c.author }] : [];
-    })
-    .sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
-  return commands.at(-1) ?? null;
-}
-
-// The node ids the snapshot needs edit history for, so load makes one lookup.
-export function editLookups(comments: readonly Comment[], prComments: readonly Comment[], bot: string): string[] {
-  return [stateCandidate(comments)?.comment, briefCandidate(comments, bot), ...commandComments([...comments, ...prComments])].flatMap((c) => (c ? [c.nodeId] : []));
-}
-
-// Reviews cannot be retargeted by an edit: the state is fixed when the review is submitted.
-export function changesRequestedFrom(reviews: readonly Review[]): IssueSnapshot['lastChangesRequested'] {
-  const r = reviews.findLast((x) => x.author === MAINTAINER && x.state === 'CHANGES_REQUESTED');
-  return r ? { at: r.at, actor: r.author } : null;
-}
-
-export async function load(gh: Gh, issue: number, bot: string): Promise<Loaded> {
+export async function load(gh: Gh, issue: number, trust: Trust, now: Date): Promise<Loaded> {
   const [comments, labels] = await Promise.all([listComments(gh, issue), issueLabels(gh, issue)]);
-  // The timeline costs a call per page, and who queued an issue only matters while the label is on it.
   const queued = stageLabel('queued');
   const queuedBy = labels.includes(queued) ? await latestLabeler(gh, issue, queued) : null;
+  // decide.ts asks authority.known(); look the queuer up now so the answer is there.
+  if (queuedBy) await trust.authority.check('queue', queuedBy.login);
 
-  // The PR comes from the state comment before its edits are checked, so one lookup covers both threads. If the
-  // state turns out tampered, the snapshot has no state, and decide.ts acts on no PR without one.
-  const prNumber = stateCandidate(comments)?.state.pr ?? (await findPull(gh, issue));
-  const pr = prNumber ? await pullSnapshot(gh, prNumber) : null;
-  const reviews = pr ? await listReviews(gh, pr.number) : [];
-  const prComments = pr ? await listComments(gh, pr.number) : [];
-  const edits = await commentEditors(gh, editLookups(comments, prComments, bot));
-
-  const found = stateFrom(comments, edits);
+  const { found, retiredKey, newer } = stateFrom(comments, issue, trust.key);
   const state = found?.state ?? null;
-  // Reviews count only from the factory bot: anyone can review on a public repo.
-  const reviewRow = reviews.findLast((r) => r.author === bot && parseReview(r.body) !== null);
-  const verdict = reviewRow ? parseReview(reviewRow.body) : null;
-
-  const stage = state?.stage;
-  const workflow = stage ? RUNNER_FOR[stage] : undefined;
-  const lastRun = stage === 'ci' && pr ? await latestCiRun(gh, issue, pr.headSha) : workflow ? await latestStageRun(gh, workflow, issue) : null;
+  const prNumber = state?.pr ?? (await findPull(gh, issue));
+  const raw = prNumber ? await pullSnapshot(gh, prNumber) : null;
+  const signed = raw ? verify(trust.key, issue, 'pr', raw.body) : false;
+  const reviews = raw ? await listReviews(gh, raw.number) : [];
+  const prComments = raw ? await listComments(gh, raw.number) : [];
+  const all = [...comments, ...prComments];
+  const edits = await commentEditors(gh, all.filter((c) => parseCommand(c.body) !== null).map((c) => c.nodeId));
 
   return {
     stateCommentId: found?.id ?? null,
-    prNodeId: pr?.nodeId ?? null,
+    prNodeId: raw?.nodeId ?? null,
+    newerState: newer,
     snap: {
       number: issue,
       state,
+      retiredKey,
       labels,
       queuedBy,
-      brief: briefFrom(comments, bot, edits),
-      pr,
-      review: reviewRow && verdict ? { blocking: verdict.blocking, at: reviewRow.at } : null,
-      lastCommand: commandFrom([...comments, ...prComments], edits),
-      lastChangesRequested: changesRequestedFrom(reviews),
-      lastRun,
+      brief: briefFrom(comments, issue, trust.key),
+      pr: raw
+        ? { number: raw.number, headSha: raw.headSha, open: raw.open, draft: raw.draft, conflicting: raw.conflicting, files: raw.files, signed, attempt: signed ? attemptOf(raw.body) : null }
+        : null,
+      review: reviewFrom(reviews, issue, trust.key),
+      lastCommand: await commandFrom(all, edits, trust.authority),
+      lastChangesRequested: await changesRequestedFrom(reviews, trust.authority),
+      lastRun: await currentRun(gh, issue, state, now),
     },
   };
 }
 
-// Every open issue carrying a stage label (done carries none).
-export async function loadAll(gh: Gh, bot: string): Promise<Map<number, Loaded>> {
-  const numbers = new Set<number>();
+// Every open issue carrying a stage label (done carries none), plus the issues named: an event's issue may carry no
+// stage label yet.
+export async function loadAll(gh: Gh, trust: Trust, now: Date, also: readonly number[] = []): Promise<Map<number, Loaded>> {
+  const numbers = new Set<number>(also);
   for (const stage of STAGES) {
     if (stage === 'done') continue;
     for (const n of await openIssuesWithLabel(gh, stageLabel(stage))) numbers.add(n);
   }
   const out = new Map<number, Loaded>();
-  for (const n of numbers) out.set(n, await load(gh, n, bot));
+  for (const n of numbers) out.set(n, await load(gh, n, trust, now));
   return out;
 }

@@ -2,48 +2,66 @@
 // return the actions to take. snapshot.ts reads GitHub into snapshots and main.ts applies the actions, so every
 // rule here is tested without the network.
 
+import { COMMAND_ROLES, type Role } from './authority.ts';
 import {
   ACTIVE_STAGES,
+  attemptId,
   branchFor,
-  MAINTAINER,
-  MAX_ATTEMPTS,
-  MAX_REBASES,
-  MAX_ROUNDS,
   RETRY_AFTER_MS,
   RUNNER_FOR,
+  type RunWorkflow,
   STUCK_AFTER_MS,
   type Stage,
-  type StageWorkflow,
   stageLabel,
   TRIAGE_READY,
   TRIAGE_STOP,
 } from './config.ts';
 import { coveredBy, riskyFiles, riskyTouches } from './globs.ts';
 import type { AfterApproval, BlockReason, Command, FactoryState, FixReason } from './markers.ts';
+import type { Limits } from './repo-config.ts';
 import { oneOf } from './util.ts';
 
-export type PullSnapshot = { number: number; headSha: string; open: boolean; draft: boolean; conflicting: boolean; files: string[] };
-export type RunSnapshot = {
-  workflow: StageWorkflow | 'ci';
-  conclusion: string | null;
+export type PullSnapshot = {
+  number: number;
   headSha: string;
+  open: boolean;
+  draft: boolean;
+  conflicting: boolean;
+  files: string[];
+  signed: boolean; // the publish job's signed footer is in the PR body
+  attempt: string | null; // the build attempt that footer names
+};
+export type RunSnapshot = {
+  workflow: RunWorkflow;
+  attempt: string | null; // from the run's title
+  // For an agent stage: 'success' only if prepare, agent and publish all succeeded. For verify: 'success' or 'failure'
+  // is the result of the checks; anything else means the run broke before it could tell.
+  conclusion: string | null;
   url: string;
-  createdAt: string | null;
   completedAt: string | null; // null while the run is still going
 };
 export type IssueSnapshot = {
   number: number;
   state: FactoryState | null;
+  retiredKey: boolean; // the newest state comment is signed with a signing key that has since been replaced
   labels: string[];
   queuedBy: { login: string; at: string } | null; // who last added agent:queued, while it is on the issue
-  brief: { id: number; touches: string[]; at: string } | null; // latest brief by the factory bot
+  brief: { id: number; touches: string[]; at: string; attempt: string | null } | null; // latest signed brief
   pr: PullSnapshot | null;
-  review: { blocking: number; at: string } | null; // latest factory review by the factory bot
-  lastCommand: { command: Command; at: string; actor: string } | null; // the maintainer's latest slash command
-  lastChangesRequested: { at: string; actor: string } | null; // the maintainer's latest changes-requested review
-  lastRun: RunSnapshot | null; // latest run of the workflow the current stage waits on
+  review: { blocking: number; at: string; sha: string | null; attempt: string | null } | null; // latest signed review
+  lastCommand: { command: Command; at: string; actor: string } | null; // the latest slash command from someone with its role
+  lastChangesRequested: { at: string; actor: string } | null; // the latest changes-requested review from the queue role
+  lastRun: RunSnapshot | null; // the current attempt's run, if it exists
 };
-export type Ctx = { now: Date; risky: readonly string[] };
+export type Ctx = {
+  now: Date;
+  risky: readonly string[];
+  limits: Limits;
+  // Whether a login holds a role. main.ts looks every actor it passes in up before deciding.
+  can: (role: Role, login: string) => boolean;
+  // Asked to review a ready PR when the state doesn't say who queued it.
+  fallbackReviewer: string | null;
+};
 
 export type FactoryEvent =
   | { kind: 'queued'; issue: number; actor: string }
@@ -54,47 +72,59 @@ export type FactoryEvent =
 
 export type Action =
   | { kind: 'save'; issue: number; state: FactoryState }
-  | { kind: 'dispatch'; issue: number; workflow: StageWorkflow }
+  | { kind: 'dispatch'; issue: number; workflow: RunWorkflow; attempt: string }
+  | { kind: 'cancel'; issue: number; workflow: RunWorkflow; attempt: string }
   | { kind: 'comment'; issue: number; body: string }
   | { kind: 'unlabel'; issue: number; labels: string[] }
-  | { kind: 'pr-ready'; pr: number };
+  | { kind: 'pr-ready'; issue: number; pr: number; reviewer: string | null };
 
-// GitHub's timestamps are whole seconds and since has milliseconds, so a run or comment from the same second the
-// stage began would otherwise read as older than it.
+// GitHub's timestamps are whole seconds and since has milliseconds, so a comment from the same second the stage
+// began would otherwise read as older than it.
 const notBefore = (at: string, since: string) => Date.parse(at) >= Math.floor(Date.parse(since) / 1000) * 1000;
+
+const mayCommand = (cmd: Command, actor: string, ctx: Ctx) => COMMAND_ROLES[cmd].some((r) => ctx.can(r, actor));
 
 export function initialState(stage: Stage, now: Date): FactoryState {
   return { stage, since: now.toISOString(), round: 0, attempts: 0, runs: [] };
 }
 
 // Move to a stage and dispatch its workflow, if it has one. Per-stage counters reset unless the patch keeps them.
+// Every entry into a stage with a workflow gets a new attempt id; a stage without one has none.
 function enter(issue: number, prev: FactoryState, stage: Stage, ctx: Ctx, patch: Partial<FactoryState> = {}): Action[] {
-  const state: FactoryState = { ...prev, attempts: 0, failedAt: undefined, ...patch, stage, since: ctx.now.toISOString() };
+  const workflow = RUNNER_FOR[stage];
+  const attempt = workflow ? attemptId(ctx.now) : undefined;
+  const state: FactoryState = { ...prev, attempts: 0, failedAt: undefined, resume: undefined, ...patch, stage, since: ctx.now.toISOString(), attempt };
   const actions: Action[] = [{ kind: 'save', issue, state }];
   // A fresh plan must not inherit the last plan's triage outcome.
   if (stage === 'planning') actions.push({ kind: 'unlabel', issue, labels: [TRIAGE_READY, ...TRIAGE_STOP] });
-  const workflow = RUNNER_FOR[stage];
-  if (workflow) actions.push({ kind: 'dispatch', issue, workflow });
+  if (workflow && attempt) actions.push({ kind: 'dispatch', issue, workflow, attempt });
   return actions;
+}
+
+// Stops the run of the attempt an issue is leaving, if it has one. Its publish job would refuse to write anyway
+// (the attempt is no longer current); cancelling saves the minutes and the Claude usage.
+function cancelRun(issue: number, prev: FactoryState): Action[] {
+  const workflow = RUNNER_FOR[prev.stage];
+  return workflow && prev.attempt ? [{ kind: 'cancel', issue, workflow, attempt: prev.attempt }] : [];
 }
 
 export function decideEvent(ev: FactoryEvent, snap: IssueSnapshot, ctx: Ctx): Action[] {
   const st = snap.state;
   switch (ev.kind) {
     case 'queued':
-      if (ev.actor !== MAINTAINER) return [];
+      if (!ctx.can('queue', ev.actor)) return [];
       if (st && st.stage !== 'done' && st.stage !== 'blocked') return [];
-      return [{ kind: 'save', issue: ev.issue, state: initialState('queued', ctx.now) }];
+      return [{ kind: 'save', issue: ev.issue, state: { ...initialState('queued', ctx.now), queuedBy: ev.actor } }];
     case 'command':
-      return ev.actor === MAINTAINER && st ? command(ev.issue, st, snap, ev.command, ctx) : [];
+      return st && mayCommand(ev.command, ev.actor, ctx) ? command(ev.issue, st, snap, ev.command, ctx) : [];
     case 'run-finished':
       return st ? runFinished(ev.issue, st, snap, ev.run, ctx) : [];
     case 'changes-requested':
-      return ev.actor === MAINTAINER && st?.stage === 'ready' ? toFix(ev.issue, st, snap, 'maintainer', ctx) : [];
+      return ctx.can('queue', ev.actor) && st?.stage === 'ready' ? toFix(ev.issue, st, snap, 'maintainer', ctx) : [];
     case 'pr-closed':
       // Only the issue's own PR finishes it; an older PR from the same branch closing must not.
       if (!st || st.stage === 'done' || (st.pr !== undefined && st.pr !== ev.pr)) return [];
-      return enter(ev.issue, st, 'done', ctx);
+      return [...enter(ev.issue, st, 'done', ctx), ...cancelRun(ev.issue, st)];
   }
 }
 
@@ -102,6 +132,7 @@ function block(issue: number, prev: FactoryState, reason: string, blockedFor: Bl
   const blockedFrom = prev.stage === 'blocked' ? prev.blockedFrom : prev.stage;
   return [
     ...enter(issue, prev, 'blocked', ctx, { blockedFrom, blockedFor }),
+    ...cancelRun(issue, prev),
     { kind: 'comment', issue, body: `Factory stopped at **${blockedFrom}**: ${reason}\n\nFix the cause, then comment \`/retry\`.` },
   ];
 }
@@ -110,25 +141,27 @@ function block(issue: number, prev: FactoryState, reason: string, blockedFor: Bl
 // may need to reset); the last allowed attempt blocks instead.
 function fail(issue: number, prev: FactoryState, reason: string, ctx: Ctx): Action[] {
   const attempts = prev.attempts + 1;
-  if (attempts >= MAX_ATTEMPTS) return block(issue, prev, `${reason} (attempt ${attempts} of ${MAX_ATTEMPTS}).`, 'attempts', ctx);
+  const max = ctx.limits.maxAttempts;
+  if (attempts >= max) return block(issue, prev, `${reason} (attempt ${attempts} of ${max}).`, 'attempts', ctx);
   return [{ kind: 'save', issue, state: { ...prev, attempts, failedAt: ctx.now.toISOString() } }];
 }
 
 function toFix(issue: number, prev: FactoryState, snap: IssueSnapshot, reason: FixReason, ctx: Ctx): Action[] {
-  // Rebases have their own cap: a rebase that never clears the conflict would loop through CI and review forever.
+  // Rebases have their own cap: a rebase that never clears the conflict would loop through verify and review forever.
   if (reason === 'rebase') {
     const rebases = (prev.rebases ?? 0) + 1;
-    if (rebases > MAX_REBASES) return block(issue, prev, `the PR conflicts with main again after ${MAX_REBASES} rebases.`, 'rebases', ctx);
+    const max = ctx.limits.maxRebases;
+    if (rebases > max) return block(issue, prev, `the PR conflicts with the default branch again after ${max} rebases.`, 'rebases', ctx);
     return onward(issue, prev, snap, 'fix', ctx, { rebases, fixReason: reason });
   }
-  // Only CI's and the reviewer's rounds count toward the cap; the maintainer's requests do not.
+  // Only verify's and the reviewer's rounds count toward the cap; a person's requests do not.
   const round = prev.round + (reason === 'ci' || reason === 'review' ? 1 : 0);
-  if (round > MAX_ROUNDS) return block(issue, prev, `still not passing after ${MAX_ROUNDS} fix rounds.`, 'rounds', ctx);
+  if (round > ctx.limits.maxRounds) return block(issue, prev, `still not passing after ${ctx.limits.maxRounds} fix rounds.`, 'rounds', ctx);
   return onward(issue, prev, snap, 'fix', ctx, { round, fixReason: reason });
 }
 
-// The PR's risky files the maintainer has not approved: none while the head is the one approved, otherwise those
-// outside the approved plan's Touches. A plan approval covers only the paths it named.
+// The PR's risky files nobody has approved: none while the head is the one approved, otherwise those outside the
+// approved plan's Touches. A plan approval covers only the paths it named.
 function unapprovedRisky(st: FactoryState, pr: PullSnapshot | null, ctx: Ctx): string[] {
   if (!pr || (pr.headSha !== '' && pr.headSha === st.approvedSha)) return [];
   const hits = riskyFiles(pr.files, ctx.risky);
@@ -136,67 +169,78 @@ function unapprovedRisky(st: FactoryState, pr: PullSnapshot | null, ctx: Ctx): s
   return hits.filter((f) => !covered.has(f));
 }
 
-// The diff gate. From review on, agents run on the PR branch and load what it changed (agent instructions, settings,
-// package scripts), so a risky diff waits for /approve before any of them runs, and before the PR is marked ready.
-// null when the diff passes. The patch is what the stage would have been entered with; it is kept for /approve.
+// The diff gate. From verify on, the factory runs what the PR branch holds (its tests and package scripts, and for
+// review and fix its agent instructions and settings), so a risky diff waits for /approve before any of that runs,
+// and before the PR is marked ready. null when the diff passes. The patch is what the stage would have been entered
+// with; it is kept for /approve.
 function diffGate(issue: number, st: FactoryState, snap: IssueSnapshot, to: AfterApproval, ctx: Ctx, patch: Partial<FactoryState> = {}): Action[] | null {
-  // No PR means no diff to check, not a clean one: review and fix would run on whatever the branch holds.
-  if (!snap.pr && to !== 'ready') return block(issue, st, `no PR from \`${branchFor(issue)}\` was found, so its diff cannot be checked.`, 'no-pr', ctx);
+  // No PR means no diff to check, not a clean one: the stage would run on whatever the branch holds.
+  if (!snap.pr) return block(issue, st, `no PR from \`${branchFor(issue)}\` was found, so its diff cannot be checked.`, 'no-pr', ctx);
   const hits = unapprovedRisky(st, snap.pr, ctx);
   if (hits.length === 0) return null;
-  return askApproval(issue, st, 'diff', hits, ctx, { ...patch, afterApproval: to, approvalSha: snap.pr?.headSha });
+  return askApproval(issue, st, 'diff', hits, ctx, { ...patch, afterApproval: to, approvalSha: snap.pr.headSha });
 }
 
-// Enter the stage the diff gate guards, if the diff passes. Review and fix record the head the gate checked: the
-// stage job refuses to run on another (a stale fixer may push in between).
+// The only way into verify, review, fix or ready. The diff must pass the gate, and the SHAs must agree:
+//   review runs only on the head verify passed on;
+//   ready needs the head, the review and verify to name the same commit;
+//   a head that moved goes back through verify (and so through this gate) first.
+// Each stage records the head the gate checked (gatedSha): its job refuses to run on another.
 function onward(issue: number, st: FactoryState, snap: IssueSnapshot, to: AfterApproval, ctx: Ctx, patch: Partial<FactoryState> = {}): Action[] {
   const gate = diffGate(issue, st, snap, to, ctx, patch);
   if (gate) return gate;
-  const gatedSha = snap.pr?.headSha;
+  const pr = snap.pr;
+  if (!pr) return []; // unreachable: the gate blocks without a PR
+  const head = pr.headSha;
+  const verified = ({ ...st, ...patch }).verifiedSha === head;
+  const verify = () => enter(issue, st, 'ci', ctx, { ...patch, gatedSha: head });
+  const review = () => enter(issue, st, 'in-review', ctx, { ...patch, gatedSha: head });
   switch (to) {
+    case 'verify':
+      return verify();
     case 'review':
-      return enter(issue, st, 'in-review', ctx, { ...patch, gatedSha });
+      return verified ? review() : verify();
     case 'fix':
-      return enter(issue, st, 'fixing', ctx, { ...patch, headSha: gatedSha, gatedSha });
+      return enter(issue, st, 'fixing', ctx, { ...patch, headSha: head, gatedSha: head });
     case 'ready':
-      return toReady(issue, { ...st, ...patch }, snap.pr?.number ?? st.pr, ctx);
+      if (!verified) return verify();
+      // A review counts only for the commit it reviewed.
+      if (!snap.review || snap.review.sha !== head) return review();
+      if (snap.review.blocking > 0) return toFix(issue, { ...st, ...patch }, snap, 'review', ctx);
+      return toReady(issue, { ...st, ...patch }, pr.number, ctx);
   }
 }
 
 // A PR that reached ready through a rebase keeps its rebase count, so the conflict → rebase → ready loop stays
 // capped; reaching ready any other way means real work landed in between, and the count starts over.
-function toReady(issue: number, prev: FactoryState, pr: number | undefined, ctx: Ctx): Action[] {
+function toReady(issue: number, prev: FactoryState, pr: number, ctx: Ctx): Action[] {
   const rebases = prev.fixReason === 'rebase' ? prev.rebases : undefined;
-  const actions = enter(issue, prev, 'ready', ctx, { approvalFor: undefined, rebases });
-  if (pr) actions.push({ kind: 'pr-ready', pr });
-  return actions;
+  return [...enter(issue, prev, 'ready', ctx, { approvalFor: undefined, rebases }), { kind: 'pr-ready', issue, pr, reviewer: prev.queuedBy ?? ctx.fallbackReviewer }];
 }
 
 function askApproval(issue: number, prev: FactoryState, approvalFor: 'plan' | 'diff', hits: string[], ctx: Ctx, patch: Partial<FactoryState> = {}): Action[] {
   const what = approvalFor === 'plan' ? 'The brief touches' : `The PR changes, at \`${patch.approvalSha ?? 'unknown'}\`,`;
   const list = hits.map((h) => `- \`${h}\``).join('\n');
-  // A later push is checked again, so the maintainer approves exactly the commit listed.
+  // A later push is checked again, so the approval covers exactly the commit listed.
   const scope = approvalFor === 'diff' ? ' A push after this commit is checked again.' : '';
   return [
     ...enter(issue, prev, 'awaiting-approval', ctx, { ...patch, approvalFor }),
-    { kind: 'comment', issue, body: `${what} risky paths (\`factory/risky-paths.txt\`):\n\n${list}\n\nComment \`/approve\` to continue or \`/stop\` to stop.${scope}` },
+    {
+      kind: 'comment',
+      issue,
+      body: `${what} risky paths (the factory's baseline and \`riskyPaths\` in \`.github/factory.json\`):\n\n${list}\n\nComment \`/approve\` to continue or \`/stop\` to stop.${scope}`,
+    },
   ];
 }
 
 function runFinished(issue: number, st: FactoryState, snap: IssueSnapshot, run: RunSnapshot, ctx: Ctx): Action[] {
-  const expected = st.stage === 'ci' ? 'ci' : RUNNER_FOR[st.stage];
+  const expected = RUNNER_FOR[st.stage];
   if (!expected || run.workflow !== expected || !run.completedAt || st.runs.includes(run.url)) return [];
+  // Only the attempt the state names counts. A run from an earlier entry into the stage is stale, however late it ends.
+  if (!st.attempt || run.attempt !== st.attempt) return [];
   if (run.conclusion === 'cancelled' || run.conclusion === 'skipped') return [];
   const seen: FactoryState = { ...st, runs: [...st.runs, run.url] };
-  if (expected === 'ci') {
-    // CI runs per push; only the run for the PR's current head decides.
-    if (!snap.pr || run.headSha !== snap.pr.headSha) return [];
-    // The fixer reads the failed log from this run: a run picked later by branch name could be anyone's.
-    const ci: FactoryState = { ...seen, ciRun: run.url };
-    return run.conclusion === 'success' ? onward(issue, ci, snap, 'review', ctx) : toFix(issue, ci, snap, 'ci', ctx);
-  }
-  // A run started before this stage began belongs to an earlier attempt, even if it finished after.
-  if (!run.createdAt || !notBefore(run.createdAt, st.since)) return [];
+  if (expected === 'verify') return verified(issue, seen, snap, run, ctx);
   if (run.conclusion !== 'success') return fail(issue, seen, `the ${expected} run ended with "${run.conclusion}"`, ctx);
   switch (expected) {
     case 'plan':
@@ -210,9 +254,19 @@ function runFinished(issue: number, st: FactoryState, snap: IssueSnapshot, run: 
   }
 }
 
+// Verify ran the repo's checks on gatedSha. Green: that commit is verified, on to review. Red: to the fixer, which
+// reads the failed log from this run (a run picked later by branch name could be anyone's). Anything else: the run
+// broke before the checks could tell, which is a failed attempt, not a fix round.
+function verified(issue: number, st: FactoryState, snap: IssueSnapshot, run: RunSnapshot, ctx: Ctx): Action[] {
+  const ci: FactoryState = { ...st, ciRun: run.url };
+  if (run.conclusion === 'success') return onward(issue, { ...ci, verifiedSha: st.gatedSha }, snap, 'review', ctx);
+  if (run.conclusion === 'failure') return toFix(issue, ci, snap, 'ci', ctx);
+  return fail(issue, st, `the verify run ended with "${run.conclusion}" before its checks finished`, ctx);
+}
+
 function planned(issue: number, st: FactoryState, snap: IssueSnapshot, ctx: Ctx): Action[] {
   if (snap.labels.some((l) => oneOf(TRIAGE_STOP, l))) return block(issue, st, 'the planner needs a human; see its comment.', 'human', ctx);
-  const brief = snap.brief && notBefore(snap.brief.at, st.since) ? snap.brief : null;
+  const brief = snap.brief && snap.brief.attempt === st.attempt ? snap.brief : null;
   if (!brief || !snap.labels.includes(TRIAGE_READY)) return fail(issue, st, 'the planner finished without a brief and the ready-for-agent label', ctx);
   const hits = riskyTouches(brief.touches, ctx.risky);
   // A new plan must not inherit what an earlier plan was approved to touch.
@@ -222,22 +276,27 @@ function planned(issue: number, st: FactoryState, snap: IssueSnapshot, ctx: Ctx)
 }
 
 function built(issue: number, st: FactoryState, snap: IssueSnapshot, ctx: Ctx): Action[] {
-  if (!snap.pr?.open) return fail(issue, st, `the builder finished without an open PR from \`${branchFor(issue)}\``, ctx);
-  return enter(issue, st, 'ci', ctx, { pr: snap.pr.number });
+  // Only the publish job signs PR bodies, and it names the attempt: a PR anyone else opened from the branch, or one
+  // an earlier build left, is not this build.
+  if (!snap.pr?.open || !snap.pr.signed || snap.pr.attempt !== st.attempt) {
+    return fail(issue, st, `the builder finished without an open PR from \`${branchFor(issue)}\` signed for this attempt`, ctx);
+  }
+  return onward(issue, st, snap, 'verify', ctx, { pr: snap.pr.number });
 }
 
 function reviewed(issue: number, st: FactoryState, snap: IssueSnapshot, ctx: Ctx): Action[] {
-  const review = snap.review && notBefore(snap.review.at, st.since) ? snap.review : null;
+  const review = snap.review && snap.review.attempt === st.attempt ? snap.review : null;
   if (!review || !snap.pr) return fail(issue, st, 'the reviewer finished without posting a factory review', ctx);
   if (review.blocking > 0) return toFix(issue, st, snap, 'review', ctx);
-  // The diff is checked again here: a plan can drift, or have been steered, after its paths were approved.
+  // The diff is checked again here: a plan can drift, or have been steered, after its paths were approved. And the
+  // head may have moved while the reviewer read the old one; onward sends that back through verify.
   return onward(issue, st, snap, 'ready', ctx);
 }
 
 function fixed(issue: number, st: FactoryState, snap: IssueSnapshot, ctx: Ctx): Action[] {
   // Without the head the fixer started from, nothing shows that it pushed.
   if (!snap.pr || st.headSha === undefined || snap.pr.headSha === st.headSha) return fail(issue, st, 'the fixer finished without pushing a commit', ctx);
-  return enter(issue, st, 'ci', ctx);
+  return onward(issue, st, snap, 'verify', ctx);
 }
 
 function command(issue: number, st: FactoryState, snap: IssueSnapshot, cmd: Command, ctx: Ctx): Action[] {
@@ -246,19 +305,18 @@ function command(issue: number, st: FactoryState, snap: IssueSnapshot, cmd: Comm
       if (st.stage !== 'awaiting-approval') return [];
       // A state without approvalFor was not written by askApproval; guessing could skip the diff check.
       if (st.approvalFor === 'plan') {
-        // Only the brief whose Touches the request listed; a newer one was not what the maintainer approved.
+        // Only the brief whose Touches the request listed; a newer one was not what was approved.
         const approvedTouches = snap.brief && snap.brief.id === st.brief ? snap.brief.touches : [];
         return enter(issue, st, 'building', ctx, { approvalFor: undefined, approvedTouches });
       }
       if (st.approvalFor === 'diff') {
         // The approval covers the head the request listed. If the PR moved since, the gate checks the new head.
         const approved: FactoryState = { ...st, approvalFor: undefined, afterApproval: undefined, approvalSha: undefined, approvedSha: st.approvalSha };
-        // Requests written before afterApproval existed came only from a clean review.
         return onward(issue, approved, snap, st.afterApproval ?? 'ready', ctx);
       }
       return [];
     case 'stop':
-      return st.stage === 'blocked' || st.stage === 'done' ? [] : block(issue, st, 'stopped by the maintainer.', 'stop', ctx);
+      return st.stage === 'blocked' || st.stage === 'done' ? [] : block(issue, st, 'stopped by a maintainer.', 'stop', ctx);
     case 'retry':
       return st.stage === 'blocked' ? retry(issue, st, snap, ctx) : [];
   }
@@ -269,89 +327,186 @@ function retry(issue: number, st: FactoryState, snap: IssueSnapshot, ctx: Ctx): 
   const from = st.blockedFrom;
   if (!from) return [];
   const clear = { blockedFrom: undefined, blockedFor: undefined };
-  // Out of rounds: the last CI log or review still has the problem, so the fixer gets a fresh set of rounds for it.
-  // Re-running the reviewer would only repeat the findings.
+  // Out of rounds: the last verify log or review still has the problem, so the fixer gets a fresh set of rounds for
+  // it. Re-running the reviewer would only repeat the findings.
   if (st.blockedFor === 'rounds' && (from === 'ci' || from === 'in-review')) {
     if (!snap.pr) return [];
     return onward(issue, st, snap, 'fix', ctx, { ...clear, round: 0, fixReason: from === 'ci' ? 'ci' : 'review' });
   }
   // Back to ready with the count cleared; the next idle sweep rebases again if the PR still conflicts.
   if (st.blockedFor === 'rebases') return enter(issue, st, from, ctx, { ...clear, rebases: undefined });
-  // Stuck or stopped at CI: no CI failure is known, so wait on CI again and let its latest run decide.
-  if (from === 'ci') return enter(issue, st, 'ci', ctx, clear);
   if (from === 'fixing') {
     // The fixer compares the PR head after its run with this one; without a PR there is nothing to fix.
     if (!snap.pr) return [];
     return onward(issue, st, snap, 'fix', ctx, clear);
   }
+  // Stuck or stopped at verify: no failure is known, so run verify again and let its result decide.
+  if (from === 'ci') return onward(issue, st, snap, 'verify', ctx, clear);
   if (from === 'in-review') return onward(issue, st, snap, 'review', ctx, clear);
   return enter(issue, st, from, ctx, clear);
 }
 
-// Starts at most one issue: first a ready PR that now conflicts with main (back to the fixer to rebase), otherwise
-// the oldest queued issue. Only when no issue is active after the given actions.
+const isActive = (s: FactoryState | null | undefined): boolean => s !== null && s !== undefined && ACTIVE_STAGES.includes(s.stage);
+
+// The stage the actions leave an issue in: the last save, if there is one.
+function stageAfter(actions: readonly Action[]): Stage | undefined {
+  let stage: Stage | undefined;
+  for (const a of actions) if (a.kind === 'save') stage = a.state.stage;
+  return stage;
+}
+
+// No slot was free for an issue that was about to become active. Keep everything the transition decided (round,
+// fix reason, approvals), but leave the issue in `waiting` with the workflow it was about to run, and dispatch nothing.
+function park(actions: readonly Action[]): Action[] {
+  const last = actions.findLastIndex((a) => a.kind === 'save');
+  return actions.flatMap((a, i): Action[] => {
+    if (a.kind === 'dispatch') return [];
+    if (a.kind !== 'save' || i !== last) return [a];
+    return [{ ...a, state: { ...a.state, stage: 'waiting', resume: RUNNER_FOR[a.state.stage], attempt: undefined } }];
+  });
+}
+
+// The admission queue. Every move from an inactive stage to an active one passes through the maxActive cap: /approve,
+// /retry, a changes-requested review and the sweep's recoveries, not only the start of a queued issue. A move that
+// doesn't fit is parked in `waiting`. Issues that were already active keep their slots.
+export function settle(snaps: readonly IssueSnapshot[], actions: readonly Action[], ctx: Ctx): Action[] {
+  const before = new Map<number, FactoryState | null>(snaps.map((s) => [s.number, s.state]));
+  const groups = new Map<number, Action[]>();
+  for (const a of actions) {
+    const g = groups.get(a.issue);
+    if (g) g.push(a);
+    else groups.set(a.issue, [a]);
+  }
+  let active = 0;
+  for (const [issue, state] of before) {
+    if (!isActive(state)) continue;
+    const to = stageAfter(groups.get(issue) ?? []);
+    if (to === undefined || ACTIVE_STAGES.includes(to)) active++;
+  }
+  const out: Action[] = [];
+  for (const [issue, acts] of groups) {
+    const to = stageAfter(acts);
+    if (to === undefined || !ACTIVE_STAGES.includes(to) || isActive(before.get(issue))) out.push(...acts);
+    else if (active < ctx.limits.maxActive) {
+      active++;
+      out.push(...acts);
+    } else out.push(...park(acts));
+  }
+  return out;
+}
+
+// A waiting issue gets its slot. The stages that run on the PR branch go back through onward(): the PR may have
+// moved, or been closed, while the issue waited.
+function resume(issue: number, st: FactoryState, snap: IssueSnapshot, ctx: Ctx): Action[] {
+  switch (st.resume) {
+    case 'plan':
+      return enter(issue, st, 'planning', ctx);
+    case 'build':
+      return enter(issue, st, 'building', ctx);
+    case 'verify':
+    case 'review':
+    case 'fix':
+      return onward(issue, st, snap, st.resume, ctx, { resume: undefined });
+    case undefined:
+      return block(issue, st, 'the issue was waiting for a slot, but its state does not say for what.', 'stuck', ctx);
+  }
+}
+
+// Fills free slots up to maxActive, in this order: waiting issues (oldest first), ready PRs that now conflict with
+// the default branch (back to the fixer to rebase), then the oldest queued issues. Waiting on a person takes no
+// slot; neither does a resume or a rebase that ends up blocked or awaiting approval.
 function startNext(snaps: readonly IssueSnapshot[], actions: readonly Action[], ctx: Ctx): Action[] {
   const after = new Map<number, FactoryState | null>(snaps.map((s) => [s.number, s.state]));
   for (const a of actions) if (a.kind === 'save') after.set(a.issue, a.state);
-  if ([...after.values()].some((s) => s && ACTIVE_STAGES.includes(s.stage))) return [];
-  for (const s of snaps) {
-    const state = after.get(s.number);
-    if (state?.stage === 'ready' && s.pr?.conflicting) return toFix(s.number, state, s, 'rebase', ctx);
+  const snapOf = new Map(snaps.map((s) => [s.number, s]));
+  let free = ctx.limits.maxActive - [...after.values()].filter(isActive).length;
+  const out: Action[] = [];
+  const take = (acts: Action[]) => {
+    out.push(...acts);
+    const to = stageAfter(acts);
+    if (to !== undefined && ACTIVE_STAGES.includes(to)) free--;
+  };
+  const oldest = (stage: Stage) =>
+    [...after.entries()].filter((e): e is [number, FactoryState] => e[1]?.stage === stage).sort((a, b) => Date.parse(a[1].since) - Date.parse(b[1].since));
+
+  for (const [issue, state] of oldest('waiting')) {
+    const s = snapOf.get(issue);
+    if (free <= 0) return out;
+    if (s) take(resume(issue, state, s, ctx));
   }
-  const queued = [...after.entries()]
-    .filter((e): e is [number, FactoryState] => e[1]?.stage === 'queued')
-    .sort((a, b) => Date.parse(a[1].since) - Date.parse(b[1].since));
-  const first = queued[0];
-  return first ? enter(first[0], first[1], 'planning', ctx) : [];
+  for (const s of snaps) {
+    if (free <= 0) return out;
+    const state = after.get(s.number);
+    if (state?.stage === 'ready' && s.pr?.conflicting) take(toFix(s.number, state, s, 'rebase', ctx));
+  }
+  for (const [issue, state] of oldest('queued')) {
+    if (free <= 0) return out;
+    take(enter(issue, state, 'planning', ctx));
+  }
+  return out;
 }
 
-// After an event, main.ts passes the event's actions: in a dry run nothing was written, so the reloaded snapshots
-// still show the issue as it was before the event.
+// What to start once an event's actions are in. main.ts passes the event's settled actions: the snapshots still show
+// the issue as it was before the event.
 export function next(snaps: readonly IssueSnapshot[], ctx: Ctx, eventActions: readonly Action[] = []): Action[] {
   return startNext(snaps, eventActions, ctx);
 }
 
-// The 30-minute sweep. Recovers what the event path can miss (the router's concurrency group drops pending runs),
-// retries failed stages, blocks stuck ones, then starts the next issue if the factory is idle.
+// The sweep. Recovers what the event path can miss (the router's concurrency group can drop pending runs), retries
+// failed stages, blocks stuck ones, then fills free slots.
 export function sweep(snaps: readonly IssueSnapshot[], ctx: Ctx): Action[] {
-  const actions = snaps.flatMap((s) => sweepOne(s, ctx));
+  const actions = settle(snaps, snaps.flatMap((s) => sweepOne(s, ctx)), ctx);
   return [...actions, ...startNext(snaps, actions, ctx)];
 }
 
-// The label alone is not enough to queue: the factory's App can write labels too, and only the maintainer starts work.
-// A blocked or done issue is queued again only by a labelling after it stopped.
-function queuedByMaintainer(snap: IssueSnapshot): boolean {
+// The label alone is not enough to queue: any workflow can write labels, and only the queue role starts work. A
+// blocked or done issue is queued again only by a labelling after it stopped.
+function queuedByRole(snap: IssueSnapshot, ctx: Ctx): boolean {
   const by = snap.queuedBy;
-  if (!snap.labels.includes(stageLabel('queued')) || by?.login !== MAINTAINER) return false;
+  if (!snap.labels.includes(stageLabel('queued')) || !by || !ctx.can('queue', by.login)) return false;
   const st = snap.state;
   return !st || ((st.stage === 'blocked' || st.stage === 'done') && notBefore(by.at, st.since));
 }
 
 function sweepOne(snap: IssueSnapshot, ctx: Ctx): Action[] {
   const st = snap.state;
-  if (queuedByMaintainer(snap)) return [{ kind: 'save', issue: snap.number, state: initialState('queued', ctx.now) }];
-  if (!st) return [];
+  if (queuedByRole(snap, ctx)) return [{ kind: 'save', issue: snap.number, state: { ...initialState('queued', ctx.now), queuedBy: snap.queuedBy?.login } }];
+  if (!st) {
+    // State signed with a replaced key can't be trusted or recovered. Say so once: the new state is signed with the
+    // current key, so the next sweep reads it as an ordinary blocked issue.
+    if (!snap.retiredKey) return [];
+    return [
+      { kind: 'save', issue: snap.number, state: { ...initialState('blocked', ctx.now), blockedFor: 'key-rotated' } },
+      { kind: 'comment', issue: snap.number, body: "The factory's signing key was replaced, so this issue's earlier state can no longer be verified. Add `agent:queued` again to start it over." },
+    ];
+  }
   // The close event can be dropped by the router's concurrency group. Only the PR the state recorded counts: before
   // a run records one, the loader finds the branch's last PR, which may be from a run that already finished.
-  if (snap.pr && !snap.pr.open && st.stage !== 'done' && snap.pr.number === st.pr) return enter(snap.number, st, 'done', ctx);
-  // snapshot.ts already keeps only the maintainer's commands; checked again so a loader change cannot open this up.
-  if (snap.lastCommand?.actor === MAINTAINER && notBefore(snap.lastCommand.at, st.since)) {
-    const acted = command(snap.number, st, snap, snap.lastCommand.command, ctx);
+  if (snap.pr && !snap.pr.open && st.stage !== 'done' && snap.pr.number === st.pr) return [...enter(snap.number, st, 'done', ctx), ...cancelRun(snap.number, st)];
+  // snapshot.ts already keeps only commands from someone with the role; checked again so a loader change cannot open
+  // this up.
+  const cmd = snap.lastCommand;
+  if (cmd && mayCommand(cmd.command, cmd.actor, ctx) && notBefore(cmd.at, st.since)) {
+    const acted = command(snap.number, st, snap, cmd.command, ctx);
     if (acted.length > 0) return acted;
   }
   // The event can be dropped by the router's concurrency group; the review itself stays on the PR.
   const cr = snap.lastChangesRequested;
-  if (st.stage === 'ready' && cr?.actor === MAINTAINER && notBefore(cr.at, st.since)) return toFix(snap.number, st, snap, 'maintainer', ctx);
+  if (st.stage === 'ready' && cr && ctx.can('queue', cr.actor) && notBefore(cr.at, st.since)) return toFix(snap.number, st, snap, 'maintainer', ctx);
   if (!ACTIVE_STAGES.includes(st.stage)) return [];
   if (st.failedAt) {
     const due = ctx.now.getTime() - Date.parse(st.failedAt) >= RETRY_AFTER_MS;
     if (!due) return [];
-    // A failed fixer may have pushed before it failed, so its retry is gated like any other run on the branch.
-    const to = st.stage === 'fixing' ? 'fix' : st.stage === 'in-review' ? 'review' : null;
-    const gate = to ? diffGate(snap.number, st, snap, to, ctx) : null;
-    if (gate) return gate;
-    // The retry runs on the head the gate just checked, which moved if the failed fixer pushed.
-    return enter(snap.number, st, st.stage, ctx, { attempts: st.attempts, ...(to ? { gatedSha: snap.pr?.headSha } : {}) });
+    // A failed fixer may have pushed before it failed, so a retry on the PR branch goes in like any other run on it:
+    // through the gate, on the head the gate just checked.
+    if (st.stage === 'fixing') {
+      // headSha stays the head the fixer was first dispatched on: if the failed run pushed, the retry has "pushed".
+      const gate = diffGate(snap.number, st, snap, 'fix', ctx);
+      return gate ?? enter(snap.number, st, 'fixing', ctx, { attempts: st.attempts, gatedSha: snap.pr?.headSha });
+    }
+    const to = st.stage === 'ci' ? 'verify' : st.stage === 'in-review' ? 'review' : null;
+    if (to) return onward(snap.number, st, snap, to, ctx, { attempts: st.attempts });
+    return enter(snap.number, st, st.stage, ctx, { attempts: st.attempts });
   }
   if (snap.lastRun) {
     const acted = runFinished(snap.number, st, snap, snap.lastRun, ctx);

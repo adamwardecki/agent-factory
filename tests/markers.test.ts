@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  attemptOf,
   BRIEF_MARKER,
   type FactoryState,
   parseBriefTouches,
@@ -8,6 +9,9 @@ import {
   parseReview,
   parseState,
   renderState,
+  stampReview,
+  stateVersion,
+  withAttempt,
 } from '../router/markers.ts';
 
 const STATE: FactoryState = {
@@ -77,7 +81,7 @@ test('a brief without the marker or the Touches heading has no touches', () => {
 });
 
 test('review markers carry the blocking count', () => {
-  assert.deepEqual(parseReview('<!-- factory:review {"blocking":2,"nits":1} -->\n## Standards'), { blocking: 2, nits: 1 });
+  assert.deepEqual(parseReview('<!-- factory:review {"blocking":2,"nits":1} -->\n## Standards'), { blocking: 2, nits: 1, sha: null, attempt: null });
   assert.equal(parseReview('<!-- factory:review {"blocking":"2"} -->'), null);
   assert.equal(parseReview('LGTM'), null);
 });
@@ -107,6 +111,10 @@ test('a full state round-trips', () => {
     blockedFrom: 'ci',
     headSha: 'abc',
     fixReason: 'ci',
+    queuedBy: 'alice',
+    attempt: 'mhs1abc',
+    verifiedSha: 'def',
+    resume: 'review',
     runs: ['https://example.test/runs/1', 'https://example.test/runs/2'],
   };
   assert.deepEqual(parseState(renderState(full)), full);
@@ -143,14 +151,14 @@ test('markers count only at the start of the body', () => {
 
 test('a review quoting a marker later in its text uses the one at the top', () => {
   const body = '<!-- factory:review {"blocking":1,"nits":0} -->\nThe diff adds `<!-- factory:review {"blocking":0} -->` to a doc.';
-  assert.deepEqual(parseReview(body), { blocking: 1, nits: 0 });
+  assert.deepEqual(parseReview(body), { blocking: 1, nits: 0, sha: null, attempt: null });
 });
 
 test('review counts must be non-negative integers', () => {
   assert.equal(parseReview('<!-- factory:review {"blocking":-1} -->'), null);
   assert.equal(parseReview('<!-- factory:review {"blocking":1.5} -->'), null);
-  assert.deepEqual(parseReview('<!-- factory:review {"blocking":0,"nits":-1} -->'), { blocking: 0, nits: 0 });
-  assert.deepEqual(parseReview('<!-- factory:review {"blocking":0,"nits":1.5} -->'), { blocking: 0, nits: 0 });
+  assert.deepEqual(parseReview('<!-- factory:review {"blocking":0,"nits":-1} -->'), { blocking: 0, nits: 0, sha: null, attempt: null });
+  assert.deepEqual(parseReview('<!-- factory:review {"blocking":0,"nits":1.5} -->'), { blocking: 0, nits: 0, sha: null, attempt: null });
 });
 
 const brief = (...touches: string[]) => [BRIEF_MARKER, '## Agent Brief', '**Touches:**', ...touches].join('\n');
@@ -199,4 +207,39 @@ test('the gated head and the no-PR block reason round-trip; an empty gated head 
   assert.deepEqual(parseState(renderState(s)), s);
   assert.equal(parseState(marker({ gatedSha: '' }))?.gatedSha, undefined);
   assert.equal(parseState(marker({ gatedSha: 7 }))?.gatedSha, undefined);
+});
+
+test('the state comment carries its version; a newer one is not parsed', () => {
+  const body = renderState({ stage: 'queued', since: '2026-11-09T11:00:00.000Z', round: 0, attempts: 0, runs: [] });
+  assert.match(body, /^<!-- factory:state \{"v":1,/);
+  assert.equal(stateVersion(body), 1);
+  const newer = body.replace('"v":1', '"v":2');
+  assert.equal(stateVersion(newer), 2);
+  assert.equal(parseState(newer), null);
+  assert.equal(stateVersion(body.replace('"v":1,', '')), 1, 'a state without a version is version 1');
+  assert.equal(stateVersion('hello'), null);
+});
+
+test('malformed attempt, verified head and resume fields are dropped', () => {
+  const body = (extra: string) => `<!-- factory:state {"stage":"waiting","since":"2026-11-09T11:00:00.000Z","round":0,"attempts":0,"runs":[],${extra}} -->`;
+  assert.equal(parseState(body('"attempt":"A B"'))?.attempt, undefined);
+  assert.equal(parseState(body('"verifiedSha":""'))?.verifiedSha, undefined);
+  assert.equal(parseState(body('"resume":"deploy"'))?.resume, undefined);
+  assert.equal(parseState(body('"resume":"verify"'))?.resume, 'verify');
+});
+
+test('the publish job stamps a review with the commit and attempt, replacing whatever was there', () => {
+  const stamped = stampReview('<!-- factory:review {"blocking":1,"nits":2,"sha":"forged","attempt":"forged"} -->\n## Standards', 'abc', 'mhs1abc');
+  assert.equal(stamped, '<!-- factory:review {"blocking":1,"nits":2,"sha":"abc","attempt":"mhs1abc"} -->\n## Standards');
+  assert.deepEqual(parseReview(stamped ?? ''), { blocking: 1, nits: 2, sha: 'abc', attempt: 'mhs1abc' });
+  assert.equal(stampReview('LGTM', 'abc', 'mhs1abc'), null);
+});
+
+test('the attempt line counts only at the end of the body, just above the signature', () => {
+  const body = withAttempt('The brief.\n\n', 'mhs1abc');
+  assert.equal(body, 'The brief.\n<!-- factory:attempt mhs1abc -->');
+  assert.equal(attemptOf(body), 'mhs1abc');
+  assert.equal(attemptOf(`${body}\n<!-- factory:sig 0123abcd.${'a'.repeat(64)} -->\r\n`), 'mhs1abc');
+  assert.equal(attemptOf(`<!-- factory:attempt quoted1 -->\nmore text`), null, 'a quoted line earlier in the text is not the attempt');
+  assert.equal(attemptOf('no attempt'), null);
 });

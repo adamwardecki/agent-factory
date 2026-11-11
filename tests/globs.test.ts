@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { coveredBy, globToRegExp, parseGlobList, riskyFiles, riskyTouches } from '../router/globs.ts';
+import { parseRepoConfig } from '../router/repo-config.ts';
 
 const RISKY = ['plugin/hooks/**', 'plugin/servers/tracker/src/db.ts', '.github/**'];
 
@@ -109,11 +109,11 @@ test('a leading **/ also matches at the root', () => {
 });
 
 // The real list has `**/X` globs with no literal prefix; they must not make every entry look risky.
-test('riskyTouches against the real list: files are checked by regex, directories and wildcards conservatively', () => {
-  const real = parseGlobList(readFileSync('router/risky-paths.txt', 'utf8'));
-  const safe = ['docs/setup.md', 'tests/factory/x.test.ts', 'README.md', 'tests/factory/*.test.ts', 'plugin/servers/tracker/src/report.ts'];
+test('riskyTouches against the built-in baseline: files are checked by regex, directories and wildcards conservatively', () => {
+  const real = parseRepoConfig({ version: 1, roles: { queue: ['alice'] }, toolchain: { node: '24.x' }, commands: { test: 'npm test' }, riskyPaths: ['src/db/**'] }).riskyPaths;
+  const safe = ['docs/setup.md', 'tests/x.test.ts', 'README.md', 'src/report.ts', 'src/api/*.ts'];
   for (const t of safe) assert.deepEqual(riskyTouches([t], real), [], t);
-  const risky = ['plugin/hooks/gates.ts', 'factory', '.github', 'plugin/hooks', 'docs/CLAUDE.md', 'tests/**', 'plugin/**', 'AGENTS.md', 'plugin/.claude/settings.json', 'docs/adr/0001-x.md', 'Makefile', 'docs/'];
+  const risky = ['.github/workflows/ci.yml', '.github', 'AGENTS.md', 'docs/CLAUDE.md', 'pkg/.claude/settings.json', 'docs/adr/0001-x.md', 'package.json', 'packages/a/package-lock.json', 'src/db/schema.ts', 'src', 'src/**', 'docs/', '.gitignore'];
   for (const t of risky) assert.deepEqual(riskyTouches([t], real), [t], t);
   assert.deepEqual(riskyTouches([], real), ['(no Touches listed)']);
 });
