@@ -46,6 +46,24 @@ test('reports about other runs, issues or attempts are refused', () => {
   assert.equal(checkReport({ ...r, workflow: 'plan' }, run, jobs, 'o/r', NOW), null);
 });
 
+test('a report sent while an earlier job is still running is ignored, not counted as a failure', () => {
+  const early = jobs.map((j) => (j.name.endsWith('agent') ? { ...j, conclusion: null, status: 'in_progress' } : j));
+  assert.equal(checkReport(r, run, early, 'o/r', NOW)?.completedAt, null, 'the agent job has not finished: nothing has happened yet');
+  assert.equal(checkReport(r, run, early, 'o/r', NOW)?.conclusion, null);
+  // The reporting job itself is the only one allowed to still be running.
+  assert.equal(checkReport(r, run, jobs, 'o/r', NOW)?.conclusion, 'success');
+  // And it has to be there: a report with no publish job in the run proves nothing.
+  assert.equal(checkReport(r, run, jobs.slice(0, 2), 'o/r', NOW)?.completedAt, null);
+  const verifyRun = { ...run, display_title: 'factory-verify #49 mhs1abc' };
+  const vr = { ...r, workflow: 'verify' as const };
+  const running = [
+    { name: 'verify / prepare', conclusion: 'success', status: 'completed' },
+    { name: 'verify / verify', conclusion: null, status: 'in_progress' },
+    { name: 'verify / report', conclusion: null, status: 'in_progress' },
+  ];
+  assert.equal(checkReport(vr, verifyRun, running, 'o/r', NOW)?.completedAt, null, 'a forged report while the checks still run');
+});
+
 test('verify tells red checks from a run that broke before them', () => {
   const v = (prepare: string | null, verify: string | null) => [
     { name: 'verify / prepare', conclusion: prepare, status: 'completed' },

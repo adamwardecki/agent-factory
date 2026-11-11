@@ -49,6 +49,8 @@ const stages = (a: Action[]) => saves(a).map((s) => s.stage);
 const dispatches = (a: Action[]) => a.flatMap((x) => (x.kind === 'dispatch' ? [x.workflow] : []));
 const comments = (a: Action[]) => a.flatMap((x) => (x.kind === 'comment' ? [x.body] : []));
 const finished = (s: IssueSnapshot, r: RunSnapshot) => decideEvent({ kind: 'run-finished', issue: 7, run: r }, s, ctx);
+const at = (n: number, s: IssueSnapshot): IssueSnapshot => ({ ...s, number: n });
+const savedStages = (a: Action[]) => a.flatMap((x) => (x.kind === 'save' ? [`${x.issue}:${x.state.stage}`] : []));
 
 test('the maintainer queues an issue', () => {
   const a = decideEvent({ kind: 'queued', issue: 7, actor: 'adamwardecki' }, snap(null), ctx);
@@ -389,12 +391,37 @@ test('reaching ready through a rebase keeps the count; any other way resets it',
   assert.equal(saves(approved)[0]?.rebases, undefined);
 });
 
-test('/retry after the rebase cap returns to ready with the count cleared', () => {
-  const a = cmd(snap(st('blocked', { blockedFrom: 'ready', blockedFor: 'rebases', rebases: 2, round: 1, pr: 51 }), { pr: pr() }), 'retry');
+test('/retry after the rebase cap returns to ready with the count cleared, when the head was verified and reviewed', () => {
+  const a = cmd(snap(st('blocked', { blockedFrom: 'ready', blockedFor: 'rebases', rebases: 2, round: 1, pr: 51 }), { pr: pr(), review: rv(0) }), 'retry');
   assert.deepEqual(stages(a), ['ready']);
   assert.equal(saves(a)[0]?.rebases, undefined);
   assert.equal(saves(a)[0]?.round, 1);
   assert.deepEqual(dispatches(a), []);
+});
+
+test('/retry into ready goes through the SHA checks: a head that moved while blocked is verified again', () => {
+  for (const blockedFor of ['rebases', 'stop'] as const) {
+    const moved = cmd(snap(st('blocked', { blockedFrom: 'ready', blockedFor, pr: 51 }), { pr: pr({ headSha: 'sha-9' }), review: rv(0) }), 'retry');
+    assert.deepEqual(stages(moved), ['ci'], blockedFor);
+    assert.deepEqual(dispatches(moved), ['verify'], blockedFor);
+    assert.ok(!moved.some((x) => x.kind === 'pr-ready'), blockedFor);
+    // Verified on this head but reviewed on another: the reviewer runs again.
+    const unreviewed = cmd(snap(st('blocked', { blockedFrom: 'ready', blockedFor, pr: 51 }), { pr: pr(), review: rv(0, { sha: 'sha-0' }) }), 'retry');
+    assert.deepEqual(dispatches(unreviewed), ['review'], blockedFor);
+  }
+  // Without a PR there is nothing to check, so the issue stays blocked.
+  assert.deepEqual(cmd(snap(st('blocked', { blockedFrom: 'ready', blockedFor: 'stop', pr: 51 })), 'retry'), []);
+});
+
+test('/retry after a /stop at waiting keeps what the issue was waiting to run', () => {
+  const waiting = at(7, snap(st('waiting', { resume: 'build' })));
+  const stopped = decideEvent({ kind: 'command', issue: 7, command: 'stop', actor: 'adamwardecki' }, waiting, ctx);
+  assert.equal(saves(stopped)[0]?.resume, 'build', 'the blocked state remembers it');
+  const back = cmd(snap(saves(stopped)[0] ?? null), 'retry');
+  assert.deepEqual(stages(back), ['waiting']);
+  assert.equal(saves(back)[0]?.resume, 'build');
+  // And the next free slot starts it, instead of calling it stuck.
+  assert.deepEqual(savedStages(next([at(7, snap(saves(back)[0] ?? null))], ctx)), ['7:building']);
 });
 
 // Why an issue was blocked, and what /retry does about it
@@ -873,8 +900,6 @@ test('ready needs the head, the review and verify to name the same commit', () =
 
 // --- Admission -----------------------------------------------------------------------------------------------------
 
-const at = (n: number, s: IssueSnapshot): IssueSnapshot => ({ ...s, number: n });
-const savedStages = (a: Action[]) => a.flatMap((x) => (x.kind === 'save' ? [`${x.issue}:${x.state.stage}`] : []));
 
 test('/approve at capacity: the approved issue waits for a slot instead of starting a second active issue', () => {
   const busy = at(2, snap(st('building')));

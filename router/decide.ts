@@ -131,7 +131,8 @@ export function decideEvent(ev: FactoryEvent, snap: IssueSnapshot, ctx: Ctx): Ac
 function block(issue: number, prev: FactoryState, reason: string, blockedFor: BlockReason, ctx: Ctx): Action[] {
   const blockedFrom = prev.stage === 'blocked' ? prev.blockedFrom : prev.stage;
   return [
-    ...enter(issue, prev, 'blocked', ctx, { blockedFrom, blockedFor }),
+    // A waiting issue keeps what it was waiting to run, so /retry can put it back in the queue (enter() clears it).
+    ...enter(issue, prev, 'blocked', ctx, { blockedFrom, blockedFor, resume: prev.resume }),
     ...cancelRun(issue, prev),
     { kind: 'comment', issue, body: `Factory stopped at **${blockedFrom}**: ${reason}\n\nFix the cause, then comment \`/retry\`.` },
   ];
@@ -333,8 +334,9 @@ function retry(issue: number, st: FactoryState, snap: IssueSnapshot, ctx: Ctx): 
     if (!snap.pr) return [];
     return onward(issue, st, snap, 'fix', ctx, { ...clear, round: 0, fixReason: from === 'ci' ? 'ci' : 'review' });
   }
-  // Back to ready with the count cleared; the next idle sweep rebases again if the PR still conflicts.
-  if (st.blockedFor === 'rebases') return enter(issue, st, from, ctx, { ...clear, rebases: undefined });
+  // Back to ready with the count cleared; the next idle sweep rebases again if the PR still conflicts. Ready is a
+  // claim about one commit, so it goes through the SHA checks like any other way in.
+  if (st.blockedFor === 'rebases') return snap.pr ? onward(issue, st, snap, 'ready', ctx, { ...clear, rebases: undefined }) : [];
   if (from === 'fixing') {
     // The fixer compares the PR head after its run with this one; without a PR there is nothing to fix.
     if (!snap.pr) return [];
@@ -343,6 +345,9 @@ function retry(issue: number, st: FactoryState, snap: IssueSnapshot, ctx: Ctx): 
   // Stuck or stopped at verify: no failure is known, so run verify again and let its result decide.
   if (from === 'ci') return onward(issue, st, snap, 'verify', ctx, clear);
   if (from === 'in-review') return onward(issue, st, snap, 'review', ctx, clear);
+  if (from === 'ready') return snap.pr ? onward(issue, st, snap, 'ready', ctx, clear) : [];
+  // A waiting issue goes back to waiting for a slot; main.ts's next start-up resumes it.
+  if (from === 'waiting') return enter(issue, st, 'waiting', ctx, { ...clear, resume: st.resume });
   return enter(issue, st, from, ctx, clear);
 }
 

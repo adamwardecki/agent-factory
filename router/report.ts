@@ -35,7 +35,14 @@ export function runSnapshot(run: unknown, jobs: readonly Job[], repo: string, no
   const title = isStageRun(run, repo) ? parseRunTitle(str(dig(run, 'display_title'))) : null;
   if (!title) return null;
   const done = dig(run, 'status') === 'completed';
-  const finished = done || reported !== undefined;
+  // A report counts only from the run's last job: the one that is allowed to still be running, with every job before
+  // it finished. A report sent earlier is not about anything that has happened yet. Anyone with write access can
+  // dispatch one, and an early forged "failure" must not burn an attempt of a run that is still going.
+  const last = title.workflow === 'verify' ? 'report' : 'publish';
+  const others = jobs.filter((j) => j.name !== last && !j.name.endsWith(` / ${last}`));
+  const reporter = job(jobs, last);
+  const reportable = reported !== undefined && reporter?.status === 'in_progress' && others.length > 0 && others.every((j) => j.status === 'completed');
+  const finished = done || reportable;
   return {
     issue: title.issue,
     workflow: title.workflow,
