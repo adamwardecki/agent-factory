@@ -52,6 +52,19 @@ test('invalid configs name the field', () => {
   assert.throws(() => parseRepoConfig({ ...minimal, riskyPaths: ['ok', 3] }), /riskyPaths/);
 });
 
+test('an unknown field is an error, so a typo cannot silently drop a protection', () => {
+  assert.throws(() => parseRepoConfig({ ...minimal, riskypaths: ['src/db/**'] }), /unknown field "riskypaths"/);
+  assert.throws(() => parseRepoConfig({ ...minimal, commands: { test: 'npm test', tests: 'x' } }), /unknown field "commands\.tests"/);
+  assert.throws(() => parseRepoConfig({ ...minimal, limits: { maxRound: 2 } }), /unknown field "limits\.maxRound"/);
+  assert.throws(() => parseRepoConfig({ ...minimal, concurrency: { max: 2 } }), /unknown field "concurrency\.max"/);
+  assert.throws(() => parseRepoConfig({ ...minimal, toolchain: { rust: '1' } }), /unknown field "toolchain\.rust"/);
+  assert.throws(() => parseRepoConfig({ ...minimal, models: { deploy: 'x' } }), /unknown field "models\.deploy"/);
+  assert.throws(() => parseRepoConfig({ ...minimal, roles: { queue: ['alice'], aprove: ['bob'] } }), /unknown field "roles\.aprove"/);
+  // The old design had a CI workflow setting; say why it is gone instead of ignoring it.
+  assert.throws(() => parseRepoConfig({ ...minimal, ci: { workflows: ['ci.yml'] } }), /ci is not a setting.*verify/);
+  assert.doesNotThrow(() => parseRepoConfig({ ...minimal, $schema: 'https://example.test/factory.schema.json' }));
+});
+
 test('what later phases switch on is refused for now, with the reason', () => {
   assert.throws(() => parseRepoConfig({ ...minimal, concurrency: { maxActive: 2 } }), /maxActive above 1/);
   assert.throws(() => parseRepoConfig({ ...minimal, roles: { queue: ['@write'] } }), /need the oidc auth mode/);

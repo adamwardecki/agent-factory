@@ -92,9 +92,22 @@ export function parseAuthMode(v: string | undefined): AuthMode {
   return v;
 }
 
+const TOP_FIELDS = ['$schema', 'version', 'roles', 'concurrency', 'defaultBranch', 'toolchain', 'commands', 'riskyPaths', 'prSkill', 'models', 'maxTurns', 'limits'];
+
+// An unknown field is an error, not something to ignore: riskypaths, spelled wrong, would silently remove a protection.
+function onlyKnown(obj: Record<string, unknown>, allowed: readonly string[], where: string): void {
+  for (const key of Object.keys(obj)) {
+    if (!allowed.includes(key)) throw new ConfigError(`unknown field "${where}${key}"; the fields here are ${allowed.join(', ')}`);
+  }
+}
+
 export function parseRepoConfig(raw: unknown, authMode: AuthMode = 'oauth_token'): RepoConfig {
   if (!isRecord(raw)) throw new ConfigError('factory.json must be a JSON object');
+  // The old design had a CI workflow setting. The factory now runs its own verify stage, so say why it is gone.
+  if (raw.ci !== undefined) throw new ConfigError('ci is not a setting: the factory runs its own verify stage with commands, and the repo\'s CI waits for a maintainer');
+  onlyKnown(raw, [...TOP_FIELDS, 'preset', 'triageLabels'], '');
   if (raw.version !== 1) throw new ConfigError(`factory.json version ${JSON.stringify(raw.version)} is not supported by this factory release (expected 1)`);
+  if (isRecord(raw.roles)) onlyKnown(raw.roles, ['queue', 'approve'], 'roles.');
   const roles = parseRoles(raw.roles);
   // A level lets everyone who can push spend the credential; with a personal subscription that is one person's plan.
   if (authMode === 'oauth_token' && hasLevels(roles)) {
@@ -103,6 +116,8 @@ export function parseRepoConfig(raw: unknown, authMode: AuthMode = 'oauth_token'
   const toolchain = isRecord(raw.toolchain) ? raw.toolchain : {};
   if (!isRecord(raw.commands)) throw new ConfigError('commands.test is required');
   const c = raw.commands;
+  onlyKnown(c, ['install', 'test', 'lint', 'typecheck', 'testFile', 'extra'], 'commands.');
+  onlyKnown(toolchain, ['node', 'python'], 'toolchain.');
   // Settings a later release adds. Ignoring one silently would leave the repo believing it was in force.
   for (const [field, value] of [['preset', raw.preset], ['triageLabels', raw.triageLabels], ['commands.extra', c.extra]] as const) {
     if (value !== undefined) throw new ConfigError(`${field} is not supported by this factory release yet; remove it`);
@@ -115,6 +130,9 @@ export function parseRepoConfig(raw: unknown, authMode: AuthMode = 'oauth_token'
   const python = optString(toolchain.python, 'toolchain.python');
   const limits = isRecord(raw.limits) ? raw.limits : {};
   const concurrency = isRecord(raw.concurrency) ? raw.concurrency : {};
+  onlyKnown(limits, ['maxRounds', 'maxRebases', 'maxAttempts'], 'limits.');
+  onlyKnown(concurrency, ['maxActive'], 'concurrency.');
+  for (const [field, value] of [['models', raw.models], ['maxTurns', raw.maxTurns]] as const) if (isRecord(value)) onlyKnown(value, STAGE_WORKFLOWS, `${field}.`);
   // The admission queue handles any cap; running more than one issue at once is switched on in phase 4, once one
   // at a time has merged a PR.
   if (concurrency.maxActive !== undefined && concurrency.maxActive !== 1) {

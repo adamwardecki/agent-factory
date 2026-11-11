@@ -15,6 +15,8 @@ test('a role rejects empty lists, read and triage levels, bots and malformed ent
   assert.throws(() => parseSelectors(['@org/team'], 'roles.queue'), /@org\/team/);
   assert.throws(() => parseSelectors(['not a login'], 'roles.queue'), /not a login/);
   assert.throws(() => parseSelectors(['renovate[bot]'], 'roles.queue'), /renovate/);
+  assert.throws(() => parseSelectors(['github-actions'], 'roles.queue'), /bot/);
+  assert.throws(() => parseSelectors(['GitHub-Actions'], 'roles.approve'), /bot/);
 });
 
 test('queue is required and approve defaults to it', () => {

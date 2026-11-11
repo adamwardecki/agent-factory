@@ -34,6 +34,8 @@ export function parseSelectors(v: unknown, field: string): Selector[] {
       return { level };
     }
     if (!LOGIN.test(entry)) throw new ConfigError(`${field}: ${JSON.stringify(entry)} is not a GitHub login`);
+    // check() would refuse it anyway; failing here tells the maintainer, instead of leaving a dead entry.
+    if (isBot(entry.toLowerCase())) throw new ConfigError(`${field}: ${JSON.stringify(entry)} is a bot, and bots can never hold a role`);
     return { login: entry };
   });
 }
