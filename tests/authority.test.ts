@@ -66,12 +66,23 @@ test('a permission level counts that level and above, looked up once per login',
   assert.equal(a.reviewer, null);
 });
 
+test('a login listed by name holds its role even when the permission lookup fails', async () => {
+  const down = async (): Promise<string | null> => {
+    throw new Error('api down');
+  };
+  const a = createAuthority(parseRoles({ queue: ['alice'], approve: ['alice', '@admin'] }), down);
+  assert.equal(await a.check('queue', 'alice'), true, 'queue lists alice and has no level: no lookup at all');
+  assert.equal(await a.check('approve', 'alice'), true, 'approve lists alice too: the name is enough');
+  await assert.rejects(a.check('approve', 'bob'), /api down/, 'a level really needs the lookup, and its failure is not hidden');
+});
+
 test('bots never count, even with admin access', async () => {
   const a = createAuthority(parseRoles({ queue: ['@write'] }), async () => 'admin');
   assert.equal(await a.check('queue', 'github-actions[bot]'), false);
   assert.equal(await a.check('queue', 'github-actions'), false);
   assert.equal(await a.check('approve', 'renovate[bot]'), false);
   assert.equal(await a.check('queue', ''), false);
+  assert.equal(await a.check('queue', 'GitHub-Actions[BOT]'), false);
 });
 
 test('each command has its roles: only approve may /approve, either may /stop', async () => {

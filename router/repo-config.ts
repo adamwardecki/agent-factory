@@ -34,10 +34,8 @@ export const BASELINE_RISKY: readonly string[] = [
   '.mcp.json',
   '.claude.json',
   'docs/agents/**',
-  'GLOSSARY.md',
-  'GLOSSARY-MAP.md',
-  'CONTEXT.md',
-  'CONTEXT-MAP.md',
+  'GLOSSARY*.md',
+  'CONTEXT*.md',
   '**/docs/adr/**',
   '.factory/**',
   '.gitignore',
@@ -59,6 +57,12 @@ function optString(v: unknown, field: string): string | null {
   return v;
 }
 
+// C0 and C1 controls, DEL, and the two Unicode line separators.
+const isControl = (ch: string): boolean => {
+  const code = ch.codePointAt(0) ?? 0;
+  return code < 0x20 || (code >= 0x7f && code <= 0x9f) || code === 0x2028 || code === 0x2029;
+};
+
 // Commands become Bash allow rules, the agents' Checks list and the verify job's steps; one line each, so a value
 // can't smuggle a second command. There is no CI workflow setting: the factory runs these commands itself (verify),
 // and the repo's own CI waits for a maintainer's approval on the PR.
@@ -68,8 +72,16 @@ function command(v: unknown, field: string, required: boolean): string | null {
     if (required) throw new ConfigError(`${field} is required`);
     return null;
   }
-  if (/[\r\n]/.test(s) || s.length > 200) throw new ConfigError(`${field} must be one line of at most 200 characters`);
+  // Control characters (a NUL, a tab, a line separator) and edge whitespace have no place in a command, and the
+  // check is what keeps a value from smuggling a second one.
+  if ([...s].some(isControl) || s !== s.trim() || s.length > 200) {
+    throw new ConfigError(`${field} must be one line of at most 200 characters, with no control characters or surrounding spaces`);
+  }
   return s;
+}
+
+function fail(message: string): never {
+  throw new ConfigError(message);
 }
 
 function int(v: unknown, field: string, min: number, max: number, fallback: number): number {
@@ -94,6 +106,15 @@ export function parseAuthMode(v: string | undefined): AuthMode {
 
 const TOP_FIELDS = ['$schema', 'version', 'roles', 'concurrency', 'defaultBranch', 'toolchain', 'commands', 'riskyPaths', 'prSkill', 'models', 'maxTurns', 'limits'];
 
+// An optional section of the config. Missing is empty; anything but an object is an error, because ignoring
+  // `toolchain: "node"` would silently drop the node manifests from the risky paths.
+function section(raw: Record<string, unknown>, name: string): Record<string, unknown> {
+  const v = raw[name];
+  if (v === undefined) return {};
+  if (!isRecord(v)) throw new ConfigError(`${name} must be an object`);
+  return v;
+}
+
 // An unknown field is an error, not something to ignore: riskypaths, spelled wrong, would silently remove a protection.
 function onlyKnown(obj: Record<string, unknown>, allowed: readonly string[], where: string): void {
   for (const key of Object.keys(obj)) {
@@ -106,6 +127,7 @@ export function parseRepoConfig(raw: unknown, authMode: AuthMode = 'oauth_token'
   // The old design had a CI workflow setting. The factory now runs its own verify stage, so say why it is gone.
   if (raw.ci !== undefined) throw new ConfigError('ci is not a setting: the factory runs its own verify stage with commands, and the repo\'s CI waits for a maintainer');
   onlyKnown(raw, [...TOP_FIELDS, 'preset', 'triageLabels'], '');
+  if (raw.version === undefined) throw new ConfigError('factory.json version is missing (expected 1)');
   if (raw.version !== 1) throw new ConfigError(`factory.json version ${JSON.stringify(raw.version)} is not supported by this factory release (expected 1)`);
   if (isRecord(raw.roles)) onlyKnown(raw.roles, ['queue', 'approve'], 'roles.');
   const roles = parseRoles(raw.roles);
@@ -113,13 +135,13 @@ export function parseRepoConfig(raw: unknown, authMode: AuthMode = 'oauth_token'
   if (authMode === 'oauth_token' && hasLevels(roles)) {
     throw new ConfigError('roles: permission levels (@write, @maintain, @admin) need the oidc auth mode; with a subscription token, list logins');
   }
-  const toolchain = isRecord(raw.toolchain) ? raw.toolchain : {};
-  if (!isRecord(raw.commands)) throw new ConfigError('commands.test is required');
+  const toolchain = section(raw, 'toolchain');
+  if (!isRecord(raw.commands)) throw new ConfigError('commands must be an object with at least test');
   const c = raw.commands;
   onlyKnown(c, ['install', 'test', 'lint', 'typecheck', 'testFile', 'extra'], 'commands.');
-  onlyKnown(toolchain, ['node', 'python'], 'toolchain.');
+  onlyKnown(toolchain, ['node', 'python', 'go'], 'toolchain.');
   // Settings a later release adds. Ignoring one silently would leave the repo believing it was in force.
-  for (const [field, value] of [['preset', raw.preset], ['triageLabels', raw.triageLabels], ['commands.extra', c.extra]] as const) {
+  for (const [field, value] of [['preset', raw.preset], ['triageLabels', raw.triageLabels], ['commands.extra', c.extra], ['toolchain.go', toolchain.go]] as const) {
     if (value !== undefined) throw new ConfigError(`${field} is not supported by this factory release yet; remove it`);
   }
   if (raw.riskyPaths !== undefined && (!Array.isArray(raw.riskyPaths) || !raw.riskyPaths.every((p) => typeof p === 'string' && p !== ''))) {
@@ -128,11 +150,11 @@ export function parseRepoConfig(raw: unknown, authMode: AuthMode = 'oauth_token'
   const own = Array.isArray(raw.riskyPaths) ? raw.riskyPaths.filter((p): p is string => typeof p === 'string') : [];
   const node = optString(toolchain.node, 'toolchain.node');
   const python = optString(toolchain.python, 'toolchain.python');
-  const limits = isRecord(raw.limits) ? raw.limits : {};
-  const concurrency = isRecord(raw.concurrency) ? raw.concurrency : {};
+  const limits = section(raw, 'limits');
+  const concurrency = section(raw, 'concurrency');
   onlyKnown(limits, ['maxRounds', 'maxRebases', 'maxAttempts'], 'limits.');
   onlyKnown(concurrency, ['maxActive'], 'concurrency.');
-  for (const [field, value] of [['models', raw.models], ['maxTurns', raw.maxTurns]] as const) if (isRecord(value)) onlyKnown(value, STAGE_WORKFLOWS, `${field}.`);
+  for (const field of ['models', 'maxTurns']) onlyKnown(section(raw, field), STAGE_WORKFLOWS, `${field}.`);
   // The admission queue handles any cap; running more than one issue at once is switched on in phase 4, once one
   // at a time has merged a PR.
   if (concurrency.maxActive !== undefined && concurrency.maxActive !== 1) {
@@ -151,7 +173,7 @@ export function parseRepoConfig(raw: unknown, authMode: AuthMode = 'oauth_token'
     },
     riskyPaths: [...BASELINE_RISKY, ...(node ? TOOLCHAIN_RISKY.node : []), ...(python ? TOOLCHAIN_RISKY.python : []), ...own],
     prSkill: optString(raw.prSkill, 'prSkill'),
-    models: perStage(raw.models, 'models', DEFAULT_MODELS, (x, f) => optString(x, f) ?? ''),
+    models: perStage(raw.models, 'models', DEFAULT_MODELS, (x, f) => optString(x, f) ?? fail(`${f} must be a non-empty string`)),
     maxTurns: perStage(raw.maxTurns, 'maxTurns', DEFAULT_TURNS, (x, f) => int(x, f, 1, 500, 1)),
     limits: {
       maxRounds: int(limits.maxRounds, 'limits.maxRounds', 1, 10, DEFAULT_LIMITS.maxRounds),

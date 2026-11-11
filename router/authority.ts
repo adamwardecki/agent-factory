@@ -74,7 +74,6 @@ export function createAuthority(roles: Roles, lookup: RoleLookup): Authority {
   };
   const listed: Record<Role, Set<string>> = { queue: logins('queue'), approve: logins('approve') };
   const min: Record<Role, number | null> = { queue: minLevel('queue'), approve: minLevel('approve') };
-  const needsLookup = hasLevels(roles);
   // The login's level on the repo as an index into LEVELS, or -1 without access.
   const levelOf = new Map<string, number>();
 
@@ -88,7 +87,10 @@ export function createAuthority(roles: Roles, lookup: RoleLookup): Authority {
   }
   async function check(role: Role, login: string): Promise<boolean> {
     const key = login.toLowerCase();
-    if (!isBot(key) && needsLookup && !levelOf.has(key)) {
+    if (isBot(key)) return false;
+    // A login listed by name needs no lookup: a failing API must not lock out the people named in the config.
+    if (listed[role].has(key)) return true;
+    if (min[role] !== null && !levelOf.has(key)) {
       const r = await lookup(login);
       levelOf.set(key, oneOf(LEVELS, r) ? LEVELS.indexOf(r) : -1);
     }

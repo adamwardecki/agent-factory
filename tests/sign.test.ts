@@ -35,4 +35,5 @@ test('unsigned and malformed bodies fail', () => {
   assert.equal(check(KEY, 7, 'brief', 'no signature'), 'unsigned');
   assert.equal(check(KEY, 7, 'brief', 'x\n<!-- factory:sig zz -->'), 'unsigned');
   assert.throws(() => sign('short', 7, 'brief', 'x'), /FACTORY_SIGNING_KEY/);
+  assert.equal(check('short', 7, 'brief', sign(KEY, 7, 'brief', 'x')), 'bad', 'a key that is too short never verifies');
 });

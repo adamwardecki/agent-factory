@@ -52,6 +52,29 @@ test('invalid configs name the field', () => {
   assert.throws(() => parseRepoConfig({ ...minimal, riskyPaths: ['ok', 3] }), /riskyPaths/);
 });
 
+test('a section of the wrong shape is an error, not an empty one', () => {
+  // toolchain: "node" used to be ignored, which dropped the node manifests and lockfiles from the risky paths.
+  for (const field of ['toolchain', 'limits', 'concurrency', 'models', 'maxTurns', 'roles', 'commands']) {
+    for (const bad of ['x', ['y'], 2, null]) {
+      assert.throws(() => parseRepoConfig({ ...minimal, [field]: bad }), new RegExp(field), `${field}: ${JSON.stringify(bad)}`);
+    }
+  }
+  assert.throws(() => parseRepoConfig({ ...minimal, models: { plan: null } }), /models\.plan/);
+  assert.throws(() => parseRepoConfig({ ...minimal, models: { plan: '' } }), /models\.plan/);
+});
+
+test('the risky baseline covers GLOSSARY and CONTEXT files by pattern, and go is not supported yet', () => {
+  const c = parseRepoConfig(minimal);
+  for (const f of ['GLOSSARY.md', 'GLOSSARY-API.md', 'CONTEXT.md', 'CONTEXT-web.md']) assert.ok(c.riskyPaths.some((g) => g === 'GLOSSARY*.md' || g === 'CONTEXT*.md') || c.riskyPaths.includes(f), f);
+  assert.ok(c.riskyPaths.includes('GLOSSARY*.md') && c.riskyPaths.includes('CONTEXT*.md'));
+  assert.throws(() => parseRepoConfig({ ...minimal, toolchain: { go: '1.22' } }), /toolchain\.go is not supported by this factory release yet/);
+  assert.throws(() => parseRepoConfig({ ...minimal, version: undefined }), /version is missing/);
+});
+
+test('commands may not hold control characters or surrounding whitespace', () => {
+  for (const bad of ['npm\u0000test', 'npm\ttest\u2028x', ' npm test', 'npm test ']) assert.throws(() => parseRepoConfig({ ...minimal, commands: { test: bad } }), /commands\.test/, JSON.stringify(bad));
+});
+
 test('an unknown field is an error, so a typo cannot silently drop a protection', () => {
   assert.throws(() => parseRepoConfig({ ...minimal, riskypaths: ['src/db/**'] }), /unknown field "riskypaths"/);
   assert.throws(() => parseRepoConfig({ ...minimal, commands: { test: 'npm test', tests: 'x' } }), /unknown field "commands\.tests"/);
