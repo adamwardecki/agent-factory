@@ -2,12 +2,15 @@
 // written once the attempt is no longer current, and running it twice writes nothing twice.
 
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import { ContractError, type Git } from '../router/contract.ts';
 import type { Gh } from '../router/github.ts';
 import { dig, str } from '../router/json.ts';
 import { type FactoryState, renderState } from '../router/markers.ts';
-import { collect, type Deps, type Files, inputFromEnv, type PublishInput, publish, type Write } from '../router/publish.ts';
+import { collect, type Deps, type Files, fsFiles, inputFromEnv, type PublishInput, publish, type Write } from '../router/publish.ts';
 import { sign, verify } from '../router/sign.ts';
 
 const KEY = 'k'.repeat(64);
@@ -220,6 +223,24 @@ test('the PR body closes its issue, names the attempt, and is inert otherwise', 
   assert.ok(pull && verify(KEY, 7, 'pr', pull.body));
   assert.match(pull.body, /\n\nCloses #7\n<!-- factory:attempt mhs1abc -->/);
   assert.doesNotMatch(pull.body, /@alice|Fixes #99/);
+});
+
+test('output files are read from disk only if they are small regular files', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'factory-out-'));
+  writeFileSync(join(dir, 'ok.md'), 'fine');
+  writeFileSync(join(dir, 'big.md'), 'x'.repeat(250_000));
+  writeFileSync(join(dir, 'target'), 'secret');
+  symlinkSync(join(dir, 'target'), join(dir, 'link.md'));
+  mkdirSync(join(dir, 'dir.md'));
+  const f = fsFiles(dir);
+  assert.equal(f.read('ok.md'), 'fine');
+  assert.equal(f.size('ok.md'), 4);
+  assert.equal(f.size('missing.md'), 0);
+  assert.throws(() => f.read('missing.md'), /did not write/);
+  assert.throws(() => f.read('big.md'), /larger than/, 'refused before it is read into memory');
+  assert.throws(() => f.read('link.md'), /not a regular file/);
+  assert.throws(() => f.size('link.md'), /not a regular file/);
+  assert.throws(() => f.read('dir.md'), /not a regular file/);
 });
 
 test('the job inputs must be well-formed', () => {

@@ -36,15 +36,21 @@ test('agent text is refused when it is empty, too long or carries a factory mark
   }
 });
 
+// What GitHub reads as "this closes that": a keyword, then (through spaces, colons and markdown emphasis) a reference.
+const closesSomething = (t: string) => /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)[\s*_:~]*(#\d|GH-\d|[\w.-]+\/[\w.-]+#\d|https?:\/\/github\.com\/\S+\/(?:issues|pull)\/\d)/i.test(t);
+
 test('mentions and closing keywords are made inert, except inside code', () => {
-  const out = inert('Thanks @alice. Fixes #12 and closes owner/repo#34. See `@scope/pkg` and:\n```\nfixes #9 by @bob\n```\nmail a@b.c');
-  assert.ok(!/@alice/.test(out) && out.includes('@​alice'));
-  assert.ok(!/Fixes #12/.test(out) && out.includes('Fixes #​12'));
-  assert.ok(out.includes('closes owner/repo#​34'));
-  assert.ok(out.includes('`@scope/pkg`'), 'code spans are untouched');
+  const forms = ['Fixes #12', 'closes owner/repo#34', 'Resolves https://github.com/o/r/issues/5', 'Fixes GH-5', '**Closes** #5', 'resolved: #7', 'CLOSE  #8'];
+  for (const f of forms) {
+    assert.ok(closesSomething(f), `${f}: the matcher knows this form`);
+    assert.ok(!closesSomething(inert(`Done. ${f}. More text.`)), f);
+  }
+  const out = inert('Thanks @alice. See `@scope/pkg` and `Closes #5`, and:\n```\nfixes #9 by @bob\n```\nmail a@b.c');
+  assert.ok(!/@alice/.test(out) && out.includes('@\u200balice'));
+  assert.ok(out.includes('`@scope/pkg`') && out.includes('`Closes #5`'), 'code spans are untouched');
   assert.ok(out.includes('fixes #9 by @bob'), 'fences are untouched');
   assert.ok(out.includes('a@b.c'), 'an address is not a mention');
-  assert.equal(inert('Refs #12'), 'Refs #12', 'a plain reference stays a link');
+  for (const plain of ['Refs #12', 'The fix for #12 is here', 'closes the loop', 'See GH-5']) assert.equal(inert(plain), plain, 'a plain reference stays a link');
 });
 
 function repo() {
@@ -57,12 +63,12 @@ function repo() {
   run(['commit', '-qm', 'base']);
   const base = run(['rev-parse', 'HEAD']);
   run(['switch', '-qc', 'work']);
-  const commit = (file: string, opts: { author?: string; link?: string } = {}) => {
+  const commit = (file: string, opts: { author?: string; link?: string; message?: string } = {}) => {
     mkdirSync(dirname(join(dir, file)), { recursive: true });
     if (opts.link) symlinkSync(opts.link, join(dir, file));
     else writeFileSync(join(dir, file), `${Math.random()}\n`);
     run(['add', '-A']);
-    run(['commit', '-qm', `change ${file}`], opts.author ? { ...bot, GIT_AUTHOR_NAME: opts.author, GIT_AUTHOR_EMAIL: 'x@example.com' } : bot);
+    run(['commit', '-qm', opts.message ?? `change ${file}`], opts.author ? { ...bot, GIT_AUTHOR_NAME: opts.author, GIT_AUTHOR_EMAIL: 'x@example.com' } : bot);
   };
   const remove = (file: string) => {
     run(['rm', '-q', file]);
@@ -108,6 +114,17 @@ test('symlinks, other authors and merge commits are refused', () => {
   merged.run(['switch', '-q', 'work']);
   merged.run(['merge', '-q', '--no-ff', '-m', 'merge', 'side']);
   assert.throws(() => checkBundle(gitIn(merged.dir), merged.bundle(), merged.base), /merge commit/);
+});
+
+test('commit messages may not close issues or add co-authors: a squash merge would carry them', () => {
+  for (const message of ['Fixes #9', 'Tidy up\n\nResolves https://github.com/o/r/issues/9', 'Add thing\n\nCo-authored-by: Evil <e@example.com>', 'closes GH-3']) {
+    const r = repo();
+    r.commit('b.txt', { message });
+    assert.throws(() => checkBundle(gitIn(r.dir), r.bundle(), r.base), /commit message/, JSON.stringify(message));
+  }
+  const ok = repo();
+  ok.commit('b.txt', { message: 'Refs #9: tidy the parser\n\nThe fix for #9 is in the next commit.' });
+  assert.doesNotThrow(() => checkBundle(gitIn(ok.dir), ok.bundle(), ok.base));
 });
 
 test('a bundle that does not build on the base, or a base that is not a SHA, is refused', () => {

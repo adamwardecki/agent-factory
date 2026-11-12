@@ -31,9 +31,17 @@ export function checkText(text: string, file: string): string {
 const CODE = /(```[\s\S]*?```|`[^`\n]*`)/;
 const ZWSP = '​';
 
+// What GitHub reads as "this closes that": a keyword, then (through spaces, colons and emphasis marks) a reference of
+// any form: #12, GH-12, owner/repo#12, or an issue or pull URL.
+const REFERENCE = '(?:#\\d|GH-\\d|[\\w.-]+\\/[\\w.-]+#\\d|https?:\\/\\/github\\.com\\/\\S+\\/(?:issues|pull)\\/\\d)';
+const KEYWORD = '\\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)';
+const CLOSING = new RegExp(`${KEYWORD}[\\s*_:~]*${REFERENCE}`, 'i');
+const CLOSING_KEYWORD = new RegExp(`${KEYWORD}(?=[\\s*_:~]*${REFERENCE})`, 'gi');
+
 // Makes agent-written markdown inert: it must not notify people or close other issues when the PR merges. A
-// zero-width space after "@" and after "#" stops GitHub from reading a mention or a closing keyword. Code spans and
-// fences are left alone: GitHub doesn't link inside them, and a brief's Touches paths live there.
+// zero-width space after "@" stops a mention, and one right after a closing keyword breaks the keyword from its
+// reference, whatever form the reference takes. Code spans and fences are left alone: GitHub doesn't link inside
+// them, and a brief's Touches paths live there.
 export function inert(text: string): string {
   return text
     .split(CODE)
@@ -42,7 +50,7 @@ export function inert(text: string): string {
         ? part
         : part
             .replace(/(^|[^\w/])@(?=[A-Za-z0-9])/g, `$1@${ZWSP}`)
-            .replace(/\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)(\s*:?\s+)((?:[\w.-]+\/[\w.-]+)?#)(?=\d)/gi, `$1$2$3${ZWSP}`),
+            .replace(CLOSING_KEYWORD, `$1${ZWSP}`),
     )
     .join('');
 }
@@ -113,6 +121,13 @@ export function checkBundle(git: Git, bundle: string, base: string): { tip: stri
     // A symlink can make a harmless path point at a risky one, and the diff gate compares paths.
     if (mode === '120000') throw new ContractError(`a commit adds or changes the symlink ${path}; that needs a human`);
     if (mode === '160000') throw new ContractError(`a commit adds or changes the submodule ${path}; that needs a human`);
+  }
+  // Commit messages end up in the squash-merge message: a closing keyword would close someone else's issue when the
+  // PR merges, and a Co-authored-by trailer would credit someone who did not write it. They can't be rewritten (that
+  // would change the commits), so they are refused, and the agent words them again.
+  for (const message of git(['log', '--format=%B%x00', range]).split('\0')) {
+    if (CLOSING.test(message)) throw new ContractError('a commit message contains a closing keyword for an issue or PR; say "Refs #n" instead');
+    if (/^co-authored-by:/im.test(message)) throw new ContractError('a commit message has a Co-authored-by trailer; the factory\'s commits have one author');
   }
   const idents = git(['log', '--format=%an <%ae>%x00%cn <%ce>', range]).split('\n').flatMap((l) => l.split('\0'));
   const stranger = idents.find((i) => i !== IDENT);

@@ -11,11 +11,11 @@
 // REPO_DIR (a full clone of the target repo), and the prepare job's outputs: STAGE, ISSUE, ATTEMPT, BASE_SHA,
 // BRANCH_SHA, GATED_SHA, PR, FIX_REASON, DEFAULT_BRANCH.
 
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { lstatSync, readFileSync, type Stats } from 'node:fs';
 import { join } from 'node:path';
 import { stale } from './attempt.ts';
 import { ATTEMPT, branchFor, isPaused, ROUTER_LOGIN, STAGE_WORKFLOWS, type StageWorkflow } from './config.ts';
-import { ContractError, checkBundle, checkPlan, checkReview, checkText, type Git, gitIn, inert, MAX_BUNDLE_BYTES, splitPr } from './contract.ts';
+import { ContractError, checkBundle, checkPlan, checkReview, checkText, type Git, gitIn, inert, MAX_BUNDLE_BYTES, MAX_TEXT, splitPr } from './contract.ts';
 import { addLabel, client, createComment, createPull, findOpenPull, type Gh, listComments, listReviews, postReview, updatePull } from './github.ts';
 import { attemptOf, FIX_REASONS, type FixReason, parseReview, stampReview, withAttempt } from './markers.ts';
 import { type SigKind, sign, verify } from './sign.ts';
@@ -37,6 +37,32 @@ export type PublishInput = {
 
 // The agent's output directory.
 export type Files = { read(name: string): string; size(name: string): number; path(name: string): string };
+
+// The agent's output directory on disk. Only plain files count: an uploaded artifact could hold a symlink to
+// anything on the runner, and a file is checked for size before it is read into memory.
+export function fsFiles(dir: string): Files {
+  const stat = (name: string) => {
+    let st: Stats;
+    try {
+      st = lstatSync(join(dir, name));
+    } catch {
+      return null;
+    }
+    if (!st.isFile()) throw new ContractError(`.factory/out/${name} is not a regular file`);
+    return st;
+  };
+  return {
+    path: (name) => join(dir, name),
+    size: (name) => stat(name)?.size ?? 0,
+    read: (name) => {
+      const st = stat(name);
+      if (!st) throw new ContractError(`the agent did not write .factory/out/${name}`);
+      // MAX_TEXT characters, at most four bytes each.
+      if (st.size > MAX_TEXT * 4) throw new ContractError(`.factory/out/${name} is ${st.size} bytes, larger than the ${MAX_TEXT * 4} a text file may be`);
+      return readFileSync(join(dir, name), 'utf8');
+    },
+  };
+}
 
 export type Write =
   | { kind: 'comment'; on: number; sig: SigKind; body: string }
@@ -182,14 +208,7 @@ async function main(): Promise<void> {
   const input = inputFromEnv(process.env);
   const out = need('OUT_DIR');
   const key = need('FACTORY_SIGNING_KEY');
-  const files: Files = {
-    path: (name) => join(out, name),
-    size: (name) => (existsSync(join(out, name)) ? statSync(join(out, name)).size : 0),
-    read: (name) => {
-      if (!existsSync(join(out, name))) throw new ContractError(`the agent did not write .factory/out/${name}`);
-      return readFileSync(join(out, name), 'utf8');
-    },
-  };
+  const files = fsFiles(out);
   const git = gitIn(need('REPO_DIR'));
   const writes = collect(input, key, files, git);
   const d: Deps = { gh: client(need('GITHUB_TOKEN'), need('GITHUB_REPOSITORY')), git, key, paused: isPaused(process.env.FACTORY_PAUSED), log: (line) => console.log(line) };
