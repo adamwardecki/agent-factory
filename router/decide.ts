@@ -25,6 +25,7 @@ export type PullSnapshot = {
   number: number;
   headSha: string;
   open: boolean;
+  base: string; // the branch the PR targets; the factory's PRs target the default branch
   draft: boolean;
   conflicting: boolean;
   files: string[];
@@ -61,6 +62,9 @@ export type Ctx = {
   can: (role: Role, login: string) => boolean;
   // Asked to review a ready PR when the state doesn't say who queued it.
   fallbackReviewer: string | null;
+  defaultBranch: string;
+  // Active issues the router can't see, because a newer release wrote their state. They still hold a slot.
+  reserved: number;
 };
 
 export type FactoryEvent =
@@ -122,8 +126,9 @@ export function decideEvent(ev: FactoryEvent, snap: IssueSnapshot, ctx: Ctx): Ac
     case 'changes-requested':
       return ctx.can('queue', ev.actor) && st?.stage === 'ready' ? toFix(ev.issue, st, snap, 'maintainer', ctx) : [];
     case 'pr-closed':
-      // Only the issue's own PR finishes it; an older PR from the same branch closing must not.
-      if (!st || st.stage === 'done' || (st.pr !== undefined && st.pr !== ev.pr)) return [];
+      // Only the issue's own PR finishes it. An older PR from the same branch closing must not, and before a run has
+      // recorded its PR there is no "own" PR yet: closing last round's PR after a re-queue is the usual order.
+      if (!st || st.stage === 'done' || st.pr === undefined || st.pr !== ev.pr) return [];
       return [...enter(ev.issue, st, 'done', ctx), ...cancelRun(ev.issue, st)];
   }
 }
@@ -155,9 +160,10 @@ function toFix(issue: number, prev: FactoryState, snap: IssueSnapshot, reason: F
     if (rebases > max) return block(issue, prev, `the PR conflicts with the default branch again after ${max} rebases.`, 'rebases', ctx);
     return onward(issue, prev, snap, 'fix', ctx, { rebases, fixReason: reason });
   }
-  // Only verify's and the reviewer's rounds count toward the cap; a person's requests do not.
+  // Only verify's and the reviewer's rounds count toward the cap; a person's requests add none, so they are never
+  // refused for rounds already spent (the cap may have been lowered since).
   const round = prev.round + (reason === 'ci' || reason === 'review' ? 1 : 0);
-  if (round > ctx.limits.maxRounds) return block(issue, prev, `still not passing after ${ctx.limits.maxRounds} fix rounds.`, 'rounds', ctx);
+  if (reason !== 'maintainer' && round > ctx.limits.maxRounds) return block(issue, prev, `still not passing after ${ctx.limits.maxRounds} fix rounds.`, 'rounds', ctx);
   return onward(issue, prev, snap, 'fix', ctx, { round, fixReason: reason });
 }
 
@@ -177,6 +183,14 @@ function unapprovedRisky(st: FactoryState, pr: PullSnapshot | null, ctx: Ctx): s
 function diffGate(issue: number, st: FactoryState, snap: IssueSnapshot, to: AfterApproval, ctx: Ctx, patch: Partial<FactoryState> = {}): Action[] | null {
   // No PR means no diff to check, not a clean one: the stage would run on whatever the branch holds.
   if (!snap.pr) return block(issue, st, `no PR from \`${branchFor(issue)}\` was found, so its diff cannot be checked.`, 'no-pr', ctx);
+  // The diff is read against the default branch; a PR into another base would be checked against the wrong files.
+  if (snap.pr.base !== ctx.defaultBranch) return block(issue, st, `PR #${snap.pr.number} targets \`${snap.pr.base}\`, not \`${ctx.defaultBranch}\`, so its diff cannot be checked.`, 'no-pr', ctx);
+  // A closed PR can't be verified, reviewed or marked ready. Its own close finishes the issue; any other PR is not
+  // something to continue on.
+  if (!snap.pr.open) {
+    if (st.pr === snap.pr.number) return [...enter(issue, st, 'done', ctx), ...cancelRun(issue, st)];
+    return block(issue, st, `PR #${snap.pr.number} is closed, so there is nothing to check.`, 'no-pr', ctx);
+  }
   const hits = unapprovedRisky(st, snap.pr, ctx);
   if (hits.length === 0) return null;
   return askApproval(issue, st, 'diff', hits, ctx, { ...patch, afterApproval: to, approvalSha: snap.pr.headSha });
@@ -279,7 +293,7 @@ function planned(issue: number, st: FactoryState, snap: IssueSnapshot, ctx: Ctx)
 function built(issue: number, st: FactoryState, snap: IssueSnapshot, ctx: Ctx): Action[] {
   // Only the publish job signs PR bodies, and it names the attempt: a PR anyone else opened from the branch, or one
   // an earlier build left, is not this build.
-  if (!snap.pr?.open || !snap.pr.signed || snap.pr.attempt !== st.attempt) {
+  if (!snap.pr?.open || snap.pr.base !== ctx.defaultBranch || !snap.pr.signed || snap.pr.attempt !== st.attempt) {
     return fail(issue, st, `the builder finished without an open PR from \`${branchFor(issue)}\` signed for this attempt`, ctx);
   }
   return onward(issue, st, snap, 'verify', ctx, { pr: snap.pr.number });
@@ -346,8 +360,11 @@ function retry(issue: number, st: FactoryState, snap: IssueSnapshot, ctx: Ctx): 
   if (from === 'ci') return onward(issue, st, snap, 'verify', ctx, clear);
   if (from === 'in-review') return onward(issue, st, snap, 'review', ctx, clear);
   if (from === 'ready') return snap.pr ? onward(issue, st, snap, 'ready', ctx, clear) : [];
-  // A waiting issue goes back to waiting for a slot; main.ts's next start-up resumes it.
-  if (from === 'waiting') return enter(issue, st, 'waiting', ctx, { ...clear, resume: st.resume });
+  // An approval that blocked right after /approve has nothing left to approve: ask again through the strictest gate.
+  if (from === 'awaiting-approval' && st.approvalFor === undefined) return snap.pr ? onward(issue, st, snap, 'ready', ctx, clear) : [];
+  // A waiting issue goes back to waiting for a slot, and the next free one starts it. One that lost what it was
+  // waiting to run starts over from the queue.
+  if (from === 'waiting') return st.resume ? enter(issue, st, 'waiting', ctx, { ...clear, resume: st.resume }) : enter(issue, st, 'queued', ctx, clear);
   return enter(issue, st, from, ctx, clear);
 }
 
@@ -382,7 +399,7 @@ export function settle(snaps: readonly IssueSnapshot[], actions: readonly Action
     if (g) g.push(a);
     else groups.set(a.issue, [a]);
   }
-  let active = 0;
+  let active = ctx.reserved;
   for (const [issue, state] of before) {
     if (!isActive(state)) continue;
     const to = stageAfter(groups.get(issue) ?? []);
@@ -424,7 +441,10 @@ function startNext(snaps: readonly IssueSnapshot[], actions: readonly Action[], 
   const after = new Map<number, FactoryState | null>(snaps.map((s) => [s.number, s.state]));
   for (const a of actions) if (a.kind === 'save') after.set(a.issue, a.state);
   const snapOf = new Map(snaps.map((s) => [s.number, s]));
-  let free = ctx.limits.maxActive - [...after.values()].filter(isActive).length;
+  let free = ctx.limits.maxActive - ctx.reserved - [...after.values()].filter(isActive).length;
+  // An issue the actions just moved is judged on the next run: a clean review on a conflicting PR claims `ready`, and
+  // the rebase is for after the reviewer has been asked about the commit it actually reviewed.
+  const touched = new Set(actions.flatMap((a) => (a.kind === 'save' ? [a.issue] : [])));
   const out: Action[] = [];
   const take = (acts: Action[]) => {
     out.push(...acts);
@@ -442,7 +462,7 @@ function startNext(snaps: readonly IssueSnapshot[], actions: readonly Action[], 
   for (const s of snaps) {
     if (free <= 0) return out;
     const state = after.get(s.number);
-    if (state?.stage === 'ready' && s.pr?.conflicting) take(toFix(s.number, state, s, 'rebase', ctx));
+    if (state?.stage === 'ready' && s.pr?.conflicting && !touched.has(s.number)) take(toFix(s.number, state, s, 'rebase', ctx));
   }
   for (const [issue, state] of oldest('queued')) {
     if (free <= 0) return out;
@@ -491,7 +511,10 @@ function sweepOne(snap: IssueSnapshot, ctx: Ctx): Action[] {
   // snapshot.ts already keeps only commands from someone with the role; checked again so a loader change cannot open
   // this up.
   const cmd = snap.lastCommand;
-  if (cmd && mayCommand(cmd.command, cmd.actor, ctx) && notBefore(cmd.at, st.since)) {
+  // An /approve must come strictly after the request it answers: whole-second timestamps would otherwise let one
+  // written just before the request count as an answer to it.
+  const answers = cmd && (cmd.command === 'approve' ? Date.parse(cmd.at) > Date.parse(st.since) : notBefore(cmd.at, st.since));
+  if (cmd && answers && mayCommand(cmd.command, cmd.actor, ctx)) {
     const acted = command(snap.number, st, snap, cmd.command, ctx);
     if (acted.length > 0) return acted;
   }
@@ -510,8 +533,9 @@ function sweepOne(snap: IssueSnapshot, ctx: Ctx): Action[] {
       return gate ?? enter(snap.number, st, 'fixing', ctx, { attempts: st.attempts, gatedSha: snap.pr?.headSha });
     }
     const to = st.stage === 'ci' ? 'verify' : st.stage === 'in-review' ? 'review' : null;
-    if (to) return onward(snap.number, st, snap, to, ctx, { attempts: st.attempts });
-    return enter(snap.number, st, st.stage, ctx, { attempts: st.attempts });
+    // The failed-attempt count belongs to the stage that failed: if the head moved, the retry is a different stage.
+    const retried = to ? onward(snap.number, st, snap, to, ctx, { attempts: st.attempts }) : enter(snap.number, st, st.stage, ctx, { attempts: st.attempts });
+    return retried.map((a) => (a.kind === 'save' && a.state.stage !== st.stage ? { ...a, state: { ...a.state, attempts: 0 } } : a));
   }
   if (snap.lastRun) {
     const acted = runFinished(snap.number, st, snap, snap.lastRun, ctx);

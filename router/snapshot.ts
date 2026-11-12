@@ -136,7 +136,7 @@ export async function load(gh: Gh, issue: number, trust: Trust, now: Date): Prom
       queuedBy,
       brief: briefFrom(comments, issue, trust.key),
       pr: raw
-        ? { number: raw.number, headSha: raw.headSha, open: raw.open, draft: raw.draft, conflicting: raw.conflicting, files: raw.files, signed, attempt: signed ? attemptOf(raw.body) : null }
+        ? { number: raw.number, headSha: raw.headSha, open: raw.open, base: raw.base, draft: raw.draft, conflicting: raw.conflicting, files: raw.files, signed, attempt: signed ? attemptOf(raw.body) : null }
         : null,
       review: reviewFrom(reviews, issue, trust.key),
       lastCommand: await commandFrom(all, edits, trust.authority),

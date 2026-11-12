@@ -25,6 +25,8 @@ const ctx: Ctx = {
   // adamwardecki holds both roles; alice may queue but not approve.
   can: (role, login) => login === 'adamwardecki' || (role === 'queue' && login === 'alice'),
   fallbackReviewer: 'adamwardecki',
+  defaultBranch: 'main',
+  reserved: 0,
 };
 const HEAD = 'sha-1';
 const AFTER_VERIFY: readonly Stage[] = ['in-review', 'fixing', 'ready', 'awaiting-approval', 'blocked', 'waiting'];
@@ -39,7 +41,7 @@ function snap(state: FactoryState | null, extra: Partial<IssueSnapshot> = {}): I
   return { number: 7, state, retiredKey: false, labels: [], queuedBy: null, brief: null, pr: null, review: null, lastCommand: null, lastChangesRequested: null, lastRun: null, ...extra };
 }
 function pr(extra: Partial<PullSnapshot> = {}): PullSnapshot {
-  return { number: 51, headSha: 'sha-1', open: true, draft: true, conflicting: false, files: ['plugin/servers/tracker/src/report.ts'], signed: true, attempt: A, ...extra };
+  return { number: 51, headSha: 'sha-1', open: true, draft: true, conflicting: false, files: ['plugin/servers/tracker/src/report.ts'], signed: true, attempt: A, base: 'main', ...extra };
 }
 function run(workflow: RunSnapshot['workflow'], conclusion: string | null = 'success', extra: Partial<RunSnapshot> = {}): RunSnapshot {
   return { workflow, attempt: A, conclusion, url: `https://example.test/runs/${workflow}-${conclusion}`, completedAt: '2026-11-09T11:30:00Z', ...extra };
@@ -88,7 +90,8 @@ test('next does nothing while another issue is active', () => {
 
 test('a closed PR finishes the issue', () => {
   assert.deepEqual(stages(decideEvent({ kind: 'pr-closed', issue: 7, pr: 51 }, snap(st('ready', { pr: 51 })), ctx)), ['done']);
-  assert.deepEqual(stages(decideEvent({ kind: 'pr-closed', issue: 7, pr: 51 }, snap(st('building')), ctx)), ['done']);
+  // Before a run has recorded its PR, a close is last round's PR, not this one's.
+  assert.deepEqual(decideEvent({ kind: 'pr-closed', issue: 7, pr: 51 }, snap(st('building')), ctx), []);
   assert.deepEqual(decideEvent({ kind: 'pr-closed', issue: 7, pr: 51 }, snap(st('done')), ctx), []);
 });
 
@@ -991,4 +994,99 @@ test('state signed with a replaced key blocks the issue once; a fresh label star
   assert.deepEqual(cmd(snap(saves(a)[0] ?? null), 'retry'), [], '/retry cannot recover state that was lost');
   const requeued = snap(null, { retiredKey: true, labels: ['agent:queued'], queuedBy: { login: 'alice', at: '2026-11-09T11:50:00Z' } });
   assert.deepEqual(stages(sweep([requeued], ctx)), ['queued', 'planning']);
+});
+
+// --- Found by the independent review of the state machine ---------------------------------------------------------
+
+test('closing an older PR does not finish a re-queued issue on the event path either', () => {
+  const requeued = snap(st('planning'), { pr: null });
+  assert.deepEqual(decideEvent({ kind: 'pr-closed', issue: 7, pr: 51 }, requeued, ctx), [], 'the new run has recorded no PR yet');
+  assert.deepEqual(decideEvent({ kind: 'pr-closed', issue: 7, pr: 51 }, snap(st('building', { pr: 52 })), ctx), []);
+  assert.deepEqual(stages(decideEvent({ kind: 'pr-closed', issue: 7, pr: 52 }, snap(st('building', { pr: 52 })), ctx)), ['done']);
+});
+
+test('a PR that is closed cannot be verified, reviewed or marked ready: its own close finishes the issue', () => {
+  const closed = pr({ open: false });
+  const done = finished(snap(st('in-review', { pr: 51 }), { pr: closed, review: rv(0) }), run('review'));
+  assert.deepEqual(stages(done), ['done']);
+  assert.ok(!done.some((x) => x.kind === 'pr-ready'));
+  // A PR that is not the issue's own is not a reason to finish it, only to stop.
+  const other = finished(snap(st('in-review', { pr: 50 }), { pr: closed, review: rv(0) }), run('review'));
+  assert.deepEqual(stages(other), ['blocked']);
+  assert.equal(saves(other)[0]?.blockedFor, 'no-pr');
+  // A waiting issue is not resumed onto a closed PR.
+  assert.deepEqual(savedStages(next([at(7, snap(st('waiting', { resume: 'review', pr: 51 }), { pr: closed }))], ctx)), ['7:done']);
+});
+
+test('a PR into another base is not the factory build', () => {
+  const stray = finished(snap(st('building'), { pr: pr({ base: 'release' }) }), run('build'));
+  assert.equal(saves(stray)[0]?.attempts, 1, 'a failed attempt, not a verify');
+  assert.deepEqual(dispatches(stray), []);
+  const gated = cmd(snap(st('blocked', { blockedFrom: 'in-review', blockedFor: 'stuck', pr: 51 }), { pr: pr({ base: 'release' }) }), 'retry');
+  assert.equal(saves(gated)[0]?.blockedFor, 'no-pr');
+});
+
+test('a changes request on a ready PR is never refused for rounds it did not add', () => {
+  const lowered: Ctx = { ...ctx, limits: { ...ctx.limits, maxRounds: 2 } };
+  const ready = snap(st('ready', { pr: 51, round: 3 }), { pr: pr(), review: rv(0) });
+  const a = decideEvent({ kind: 'changes-requested', issue: 7, actor: 'adamwardecki' }, ready, lowered);
+  assert.deepEqual(stages(a), ['fixing']);
+  assert.equal(saves(a)[0]?.round, 3, 'a person\'s request adds no round');
+  // The cap still applies to the rounds that do count.
+  assert.deepEqual(stages(finished(snap(st('in-review', { pr: 51, round: 2 }), { pr: pr(), review: rv(1) }), run('review'))), ['fixing']);
+  assert.deepEqual(stages(finished(snap(st('in-review', { pr: 51, round: 3 }), { pr: pr(), review: rv(1) }), run('review'))), ['blocked']);
+});
+
+test('a retried stage keeps its failed-attempt count only if it is the same stage', () => {
+  const failed = { attempts: 1, failedAt: '2026-11-09T10:30:00Z', pr: 51 };
+  // The reviewer failed once; the head moved, so the retry is a verify run, which has had no failures.
+  const moved = sweep([snap(st('in-review', failed), { pr: pr({ headSha: 'sha-2' }) })], ctx);
+  assert.deepEqual(stages(moved), ['ci']);
+  assert.equal(saves(moved)[0]?.attempts, 0);
+  // The same stage again keeps it, so the last allowed attempt still blocks.
+  const same = sweep([snap(st('in-review', failed), { pr: pr() })], ctx);
+  assert.deepEqual(stages(same), ['in-review']);
+  assert.equal(saves(same)[0]?.attempts, 1);
+});
+
+test('the sweep does not replay an /approve written before the approval request, even in the same second', () => {
+  const requested = st('awaiting-approval', { approvalFor: 'plan', brief: 900, since: '2026-11-09T11:59:59.900Z' });
+  const early = snap(requested, { brief: BRIEF, lastCommand: { command: 'approve', at: '2026-11-09T11:59:59Z', actor: 'adamwardecki' } });
+  assert.deepEqual(sweep([early], ctx), []);
+  const later = snap(requested, { brief: BRIEF, lastCommand: { command: 'approve', at: '2026-11-09T12:00:00Z', actor: 'adamwardecki' } });
+  assert.deepEqual(stages(sweep([later], ctx)), ['building']);
+  // Other commands keep the whole-second rule: a /stop in the same second still counts.
+  const stop = snap(st('building', { since: '2026-11-09T11:59:59.900Z' }), { lastCommand: { command: 'stop', at: '2026-11-09T11:59:59Z', actor: 'adamwardecki' } });
+  assert.deepEqual(stages(sweep([stop], ctx)), ['blocked']);
+});
+
+test('a clean review on a conflicting PR does not mark it ready and rebase it in the same run', () => {
+  const s = snap(st('in-review', { pr: 51 }), { pr: pr({ conflicting: true }), review: rv(0) });
+  const raw = finished(s, run('review'));
+  assert.deepEqual(stages(raw), ['ready']);
+  const after = [...raw, ...next([s], ctx, raw)];
+  assert.deepEqual(stages(after), ['ready'], 'the rebase waits for the next sweep');
+});
+
+test('a /retry of an approval that blocked after /approve asks for approval again', () => {
+  // /approve cleared approvalFor, then the gate blocked (no PR): the blocked state remembers nothing to approve.
+  const blocked = snap(st('blocked', { blockedFrom: 'awaiting-approval', blockedFor: 'no-pr', pr: 51 }), { pr: pr({ files: ['plugin/hooks/gates.ts'] }), review: rv(0) });
+  const a = cmd(blocked, 'retry');
+  assert.deepEqual(stages(a), ['awaiting-approval']);
+  assert.equal(saves(a)[0]?.approvalFor, 'diff');
+  assert.deepEqual(stages(cmd(snap(saves(a)[0] ?? null, { pr: pr({ files: ['plugin/hooks/gates.ts'] }), review: rv(0) }), 'approve')), ['ready']);
+});
+
+test('a waiting issue that lost what it was waiting for goes back to the queue on /retry', () => {
+  const lost = cmd(snap(st('blocked', { blockedFrom: 'waiting', blockedFor: 'stuck' })), 'retry');
+  assert.deepEqual(stages(lost), ['queued']);
+});
+
+test('an issue whose state a newer release wrote still takes its slot, so the cap holds in a mixed rollout', () => {
+  // main.ts passes the number of such active issues as `reserved`.
+  const busy = at(2, snap(st('building')));
+  const queued = at(3, snap(st('queued')));
+  assert.deepEqual(next([busy, queued], { ...withActive(2), reserved: 1 }), []);
+  assert.deepEqual(savedStages(next([busy, queued], { ...withActive(3), reserved: 1 })), ['3:planning']);
+  assert.deepEqual(savedStages(next([queued], { ...withActive(1), reserved: 0 })), ['3:planning']);
 });

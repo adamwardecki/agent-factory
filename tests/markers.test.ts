@@ -207,6 +207,8 @@ test('the gated head and the no-PR block reason round-trip; an empty gated head 
   assert.deepEqual(parseState(renderState(s)), s);
   assert.equal(parseState(marker({ gatedSha: '' }))?.gatedSha, undefined);
   assert.equal(parseState(marker({ gatedSha: 7 }))?.gatedSha, undefined);
+  // An empty fixer head would never equal a PR head and so would pass for "the fixer pushed nothing" the wrong way.
+  assert.equal(parseState(marker({ headSha: '' }))?.headSha, undefined);
 });
 
 test('the state comment carries its version; a newer one is not parsed', () => {

@@ -7,7 +7,7 @@
 
 import { readFileSync } from 'node:fs';
 import { COMMAND_ROLES, createAuthority, holdsAny } from './authority.ts';
-import { CONFIG_PATH, ConfigError, isDryRun, isPaused, issueForBranch, stageLabel } from './config.ts';
+import { ACTIVE_STAGES, CONFIG_PATH, ConfigError, isDryRun, isPaused, issueForBranch, stageLabel } from './config.ts';
 import { type Action, type Ctx, decideEvent, type FactoryEvent, next, settle, sweep } from './decide.ts';
 import { parseEvent } from './events.ts';
 import {
@@ -133,7 +133,7 @@ async function main(): Promise<void> {
   const authority = createAuthority(config.roles, (login) => collaboratorRole(gh, login));
   const trust: Trust = { key, authority };
   const now = new Date();
-  const ctx: Ctx = { now, risky: config.riskyPaths, limits: config.limits, can: (role, login) => authority.known(role, login), fallbackReviewer: authority.reviewer };
+  const base: Ctx = { now, risky: config.riskyPaths, limits: config.limits, can: (role, login) => authority.known(role, login), fallbackReviewer: authority.reviewer, defaultBranch: ref, reserved: 0 };
   const ap: Apply = { gh, key, ref, dry };
 
   const parsed = parseEvent(env('GITHUB_EVENT_NAME'), JSON.parse(readFileSync(env('GITHUB_EVENT_PATH'), 'utf8')), repo);
@@ -169,11 +169,16 @@ async function main(): Promise<void> {
   // Every issue is loaded before anything is decided, so the event is admitted against the real number of active
   // issues.
   const all = await loadAll(gh, trust, now, event ? [event.issue] : []);
+  // An issue a newer release wrote is left alone, but if it is running it still holds a slot: during a rollout the
+  // two releases share one cap.
+  let reserved = 0;
   for (const [n, l] of all) {
     if (!l.newerState) continue;
     console.log(`::warning::Issue #${n}: its state was written by a newer agent-factory release than this pin; left alone. Pin that release or newer.`);
+    if (l.snap.labels.some((x) => ACTIVE_STAGES.map(stageLabel).includes(x))) reserved++;
     all.delete(n);
   }
+  const ctx: Ctx = { ...base, reserved };
   const snaps = [...all.values()].map((l) => l.snap);
   if (event === null) return apply(ap, all, sweep(snaps, ctx));
   const target = all.get(event.issue);

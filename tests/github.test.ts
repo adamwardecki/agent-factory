@@ -76,6 +76,11 @@ test('pullSnapshot reads whether the PR is a draft', async () => {
   assert.equal((await pullSnapshot(draft, 51)).draft, true);
 });
 
+test('pullSnapshot reads the base branch', async () => {
+  const gh = fake((c) => (c.path.includes('/files') ? [] : { head: { sha: 'abc' }, base: { ref: 'release' }, state: 'open' }));
+  assert.equal((await pullSnapshot(gh, 51)).base, 'release');
+});
+
 test('comments and reviews carry their GraphQL node id', async () => {
   const gh = fake((c) => (c.path.includes('/reviews') ? [{ id: 2, node_id: 'PRR_2', user: { login: 'a' }, body: 'b', state: 'COMMENTED' }] : [{ id: 1, node_id: 'IC_1', user: { login: 'a' }, body: 'b' }]));
   assert.equal((await listComments(gh, 7))[0]?.nodeId, 'IC_1');

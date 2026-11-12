@@ -112,7 +112,7 @@ export function parseState(body: string): FactoryState | null {
   if (oneOf(STAGES, v.blockedFrom)) s.blockedFrom = v.blockedFrom;
   if (oneOf(BLOCK_REASONS, v.blockedFor)) s.blockedFor = v.blockedFor;
   if (count(v.rebases)) s.rebases = v.rebases;
-  if (typeof v.headSha === 'string') s.headSha = v.headSha;
+  if (sha(v.headSha)) s.headSha = v.headSha;
   if (sha(v.gatedSha)) s.gatedSha = v.gatedSha;
   if (oneOf(FIX_REASONS, v.fixReason)) s.fixReason = v.fixReason;
   if (typeof v.queuedBy === 'string' && v.queuedBy !== '') s.queuedBy = v.queuedBy;

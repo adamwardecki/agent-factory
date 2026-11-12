@@ -128,6 +128,7 @@ export async function pullSnapshot(gh: Gh, pr: number): Promise<Omit<PullSnapsho
     number: pr,
     headSha: str(dig(p, 'head', 'sha')),
     open: dig(p, 'state') === 'open',
+    base: str(dig(p, 'base', 'ref')),
     draft: dig(p, 'draft') === true,
     conflicting: dig(p, 'mergeable_state') === 'dirty',
     files,
