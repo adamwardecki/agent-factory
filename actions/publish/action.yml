@@ -1,0 +1,55 @@
+name: factory publish
+description: Checks the agent's output, makes the stage's writes if this run is still the current attempt, then reports to the router.
+inputs:
+  stage: { required: true }
+  issue: { required: true }
+  attempt: { required: true }
+  signing-key: { required: true }
+  paused: { required: false, default: '' }
+  agent-result: { required: true }
+  default-branch: { required: true }
+  base-sha: { required: true }
+  branch-sha: { required: false, default: '' }
+  gated-sha: { required: false, default: '' }
+  pr: { required: false, default: '' }
+  fix-reason: { required: false, default: '' }
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: 24.x
+    - if: inputs.agent-result == 'success'
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: factory-out
+        path: factory-out
+    - id: publish
+      if: inputs.agent-result == 'success'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        FACTORY_SIGNING_KEY: ${{ inputs.signing-key }}
+        FACTORY_PAUSED: ${{ inputs.paused }}
+        OUT_DIR: ${{ github.workspace }}/factory-out
+        REPO_DIR: ${{ github.workspace }}/target
+        STAGE: ${{ inputs.stage }}
+        ISSUE: ${{ inputs.issue }}
+        ATTEMPT: ${{ inputs.attempt }}
+        DEFAULT_BRANCH: ${{ inputs.default-branch }}
+        BASE_SHA: ${{ inputs.base-sha }}
+        BRANCH_SHA: ${{ inputs.branch-sha }}
+        GATED_SHA: ${{ inputs.gated-sha }}
+        PR: ${{ inputs.pr }}
+        FIX_REASON: ${{ inputs.fix-reason }}
+      run: node --no-warnings .factory-src/router/publish.ts
+    # Always report, so the router hears about failures as well as successes without waiting for the sweep.
+    - if: always()
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        STAGE: ${{ inputs.stage }}
+        ISSUE: ${{ inputs.issue }}
+        ATTEMPT: ${{ inputs.attempt }}
+        RESULT: ${{ inputs.agent-result == 'success' && steps.publish.outcome == 'success' && 'success' || 'failure' }}
+      run: gh workflow run factory-router.yml -R "$GITHUB_REPOSITORY" -f report_stage="$STAGE" -f report_issue="$ISSUE" -f report_attempt="$ATTEMPT" -f report_run_id="$GITHUB_RUN_ID" -f report_result="$RESULT"

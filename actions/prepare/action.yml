@@ -1,0 +1,58 @@
+name: factory prepare
+description: Checks that this run is the issue's current attempt, then builds the stage's inputs where the signing key is but the agent isn't.
+inputs:
+  stage: { required: true }
+  issue: { required: true }
+  attempt: { required: true }
+  signing-key: { required: true }
+  auth-mode: { required: false, default: oauth_token }
+outputs:
+  attempt: { value: '${{ steps.prep.outputs.attempt }}' }
+  default-branch: { value: '${{ steps.prep.outputs.default-branch }}' }
+  base-sha: { value: '${{ steps.prep.outputs.base-sha }}' }
+  branch-sha: { value: '${{ steps.prep.outputs.branch-sha }}' }
+  gated-sha: { value: '${{ steps.prep.outputs.gated-sha }}' }
+  pr: { value: '${{ steps.prep.outputs.pr }}' }
+  fix-reason: { value: '${{ steps.prep.outputs.fix-reason }}' }
+  node: { value: '${{ steps.prep.outputs.node }}' }
+  python: { value: '${{ steps.prep.outputs.python }}' }
+  install: { value: '${{ steps.prep.outputs.install }}' }
+  model: { value: '${{ steps.prep.outputs.model }}' }
+  max-turns: { value: '${{ steps.prep.outputs.max-turns }}' }
+  allowed-tools: { value: '${{ steps.prep.outputs.allowed-tools }}' }
+  scrub: { value: '${{ steps.prep.outputs.scrub }}' }
+  test: { value: '${{ steps.prep.outputs.test }}' }
+  lint: { value: '${{ steps.prep.outputs.lint }}' }
+  typecheck: { value: '${{ steps.prep.outputs.typecheck }}' }
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: 24.x
+    - id: prep
+      shell: bash
+      env:
+        STAGE: ${{ inputs.stage }}
+        ISSUE: ${{ inputs.issue }}
+        ATTEMPT: ${{ inputs.attempt }}
+        GITHUB_TOKEN: ${{ github.token }}
+        GH_TOKEN: ${{ github.token }}
+        FACTORY_SIGNING_KEY: ${{ inputs.signing-key }}
+        FACTORY_AUTH_MODE: ${{ inputs.auth-mode }}
+      run: |
+        [[ "$ISSUE" =~ ^[0-9]+$ ]] || { echo "::error::issue must be a number"; exit 1; }
+        node --no-warnings .factory-src/router/prepare.ts "$STAGE" "$ISSUE" "$ATTEMPT" factory-in
+        # The log comes only from the verify run the router recorded. The fence is six tildes, so a log line of
+        # backticks can't close it.
+        if [[ -f factory-in/ci-run-id ]]; then
+          run_id=$(cat factory-in/ci-run-id)
+          [[ "$run_id" =~ ^[0-9]+$ ]] || { echo "::error::bad ci-run-id"; exit 1; }
+          { echo '~~~~~~'; gh run view "$run_id" -R "$GITHUB_REPOSITORY" --log-failed | tail -n 300; echo '~~~~~~'; } >> factory-in/context.md
+        fi
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: factory-in
+        path: factory-in
+        retention-days: 1
+        if-no-files-found: ignore

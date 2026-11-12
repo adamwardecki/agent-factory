@@ -1,0 +1,129 @@
+name: factory stage
+
+# One agent stage (plan, build, review or fix), called by the target repo's factory-stage.yml. Three jobs:
+#   prepare  holds the signing key and reads; refuses unless this run is the issue's current attempt.
+#   agent    runs Claude with a read-only token and no key; writes its output to files.
+#   publish  holds the key and the write token; runs factory code only.
+# Caller interface 1. Inputs are only ever added, and only as optional, within one interface version.
+
+on:
+  workflow_call:
+    inputs:
+      interface: { type: number, required: true }
+      stage: { type: string, required: true }
+      issue: { type: string, required: true }
+      attempt: { type: string, required: true }
+      paused: { type: string, required: false, default: '' }
+    secrets:
+      FACTORY_SIGNING_KEY: { required: true }
+      CLAUDE_CODE_OAUTH_TOKEN: { required: true }
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: { contents: read, issues: read, pull-requests: read, actions: read }
+    outputs:
+      attempt: ${{ steps.prep.outputs.attempt }}
+      default-branch: ${{ steps.prep.outputs.default-branch }}
+      base-sha: ${{ steps.prep.outputs.base-sha }}
+      branch-sha: ${{ steps.prep.outputs.branch-sha }}
+      gated-sha: ${{ steps.prep.outputs.gated-sha }}
+      pr: ${{ steps.prep.outputs.pr }}
+      fix-reason: ${{ steps.prep.outputs.fix-reason }}
+      node: ${{ steps.prep.outputs.node }}
+      python: ${{ steps.prep.outputs.python }}
+      install: ${{ steps.prep.outputs.install }}
+      model: ${{ steps.prep.outputs.model }}
+      max-turns: ${{ steps.prep.outputs.max-turns }}
+      allowed-tools: ${{ steps.prep.outputs.allowed-tools }}
+      scrub: ${{ steps.prep.outputs.scrub }}
+    steps:
+      - name: Check the caller interface
+        env: { INTERFACE: '${{ inputs.interface }}' }
+        run: '[[ "$INTERFACE" == "1" ]] || { echo "::error::This agent-factory release speaks caller interface 1, not $INTERFACE. Re-render the caller workflows for the release you pin."; exit 1; }'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { repository: '${{ job.workflow_repository }}', ref: '${{ job.workflow_sha }}', path: .factory-src, persist-credentials: false }
+      - id: prep
+        uses: ./.factory-src/actions/prepare
+        with:
+          stage: ${{ inputs.stage }}
+          issue: ${{ inputs.issue }}
+          attempt: ${{ inputs.attempt }}
+          signing-key: ${{ secrets.FACTORY_SIGNING_KEY }}
+          auth-mode: oauth_token
+
+  agent:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions: { contents: read, issues: read, pull-requests: read, actions: read }
+    steps:
+      # The default branch at the commit prepare recorded: tools and skills are set up from here, never from the PR
+      # branch. fetch-depth 0 also brings the factory branch in; no credentials stay behind for a later fetch or push.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { ref: '${{ needs.prepare.outputs.base-sha }}', fetch-depth: 0, persist-credentials: false }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { repository: '${{ job.workflow_repository }}', ref: '${{ job.workflow_sha }}', path: .factory-src, persist-credentials: false }
+      - uses: ./.factory-src/actions/agent-setup
+        with:
+          stage: ${{ inputs.stage }}
+          node: ${{ needs.prepare.outputs.node }}
+          python: ${{ needs.prepare.outputs.python }}
+          install: ${{ needs.prepare.outputs.install }}
+          scrub: ${{ needs.prepare.outputs.scrub }}
+      # The factory's code leaves the workspace before the agent starts: the repo's lint must not trip over it, and
+      # the agent has no business reading it.
+      - run: mv .factory-src "$RUNNER_TEMP/factory-src"
+      # The router's diff gate checked exactly this commit. A push since then was not checked, so the job stops.
+      - name: Switch to the PR head the router checked
+        if: inputs.stage == 'review' || inputs.stage == 'fix'
+        env: { ISSUE: '${{ inputs.issue }}', GATED: '${{ needs.prepare.outputs.gated-sha }}' }
+        run: |
+          [[ "$GATED" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::no gated head for this stage"; exit 1; }
+          [[ "$(git rev-parse "origin/factory/issue-$ISSUE")" == "$GATED" ]] || { echo "::error::the PR head is not the head the router checked"; exit 1; }
+          git switch -q -C "factory/issue-$ISSUE" "$GATED"
+      - uses: anthropics/claude-code-action@4fa93a88de49bbef68b10eb15aabedf28ca0e1ed # v1.0.271
+        env: { CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '${{ needs.prepare.outputs.scrub }}' }
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          allowed_bots: github-actions
+          bot_id: '41898282'
+          bot_name: github-actions[bot]
+          prompt: /factory-${{ inputs.stage }} ${{ inputs.issue }}
+          claude_args: >-
+            --model ${{ needs.prepare.outputs.model }}
+            --max-turns ${{ needs.prepare.outputs.max-turns }}
+            --allowedTools "${{ needs.prepare.outputs.allowed-tools }}"
+          plugin_marketplaces: ${{ runner.temp }}/mp-skills
+          plugins: mattpocock-skills@mattpocock
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with: { name: factory-out, path: .factory/out, retention-days: 1, include-hidden-files: true }
+
+  publish:
+    needs: [prepare, agent]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: { contents: write, issues: write, pull-requests: write, actions: write }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { repository: '${{ job.workflow_repository }}', ref: '${{ job.workflow_sha }}', path: .factory-src, persist-credentials: false }
+      # The clone the bundle is imported into and pushed from. Nothing in it is ever run or checked out again.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { path: target, fetch-depth: 0 }
+      - uses: ./.factory-src/actions/publish
+        with:
+          stage: ${{ inputs.stage }}
+          issue: ${{ inputs.issue }}
+          attempt: ${{ needs.prepare.outputs.attempt }}
+          signing-key: ${{ secrets.FACTORY_SIGNING_KEY }}
+          paused: ${{ inputs.paused }}
+          agent-result: ${{ needs.agent.result }}
+          default-branch: ${{ needs.prepare.outputs.default-branch }}
+          base-sha: ${{ needs.prepare.outputs.base-sha }}
+          branch-sha: ${{ needs.prepare.outputs.branch-sha }}
+          gated-sha: ${{ needs.prepare.outputs.gated-sha }}
+          pr: ${{ needs.prepare.outputs.pr }}
+          fix-reason: ${{ needs.prepare.outputs.fix-reason }}

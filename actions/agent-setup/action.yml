@@ -1,0 +1,60 @@
+name: factory agent setup
+description: Inputs, toolchain, skills and sandbox for the agent job. Runs on the default branch's checkout, before the switch to the PR branch.
+inputs:
+  stage: { required: true }
+  node: { required: false, default: '' }
+  python: { required: false, default: '' }
+  install: { required: false, default: '' }
+  scrub: { required: false, default: '' }
+runs:
+  using: composite
+  steps:
+    - if: inputs.stage != 'plan'
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: factory-in
+        path: .factory/in
+    - shell: bash
+      run: |
+        # The agent must never commit the factory's own files.
+        printf '.factory/\n.factory-src/\n' >> .git/info/exclude
+        # The publish job refuses commits by anyone else.
+        git config user.name 'github-actions[bot]'
+        git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+        # A rebase that stops on a conflict must continue without opening an editor.
+        git config core.editor true
+        git config sequence.editor true
+        mkdir -p .factory/out ~/.claude/skills
+        cp -r .factory-src/skills/factory-* ~/.claude/skills/
+        if [[ -f .factory/in/context.md ]]; then cp .factory/in/context.md .factory/context.md; fi
+        repo=$(jq -r .repo .factory-src/skills.lock.json); ref=$(jq -r .ref .factory-src/skills.lock.json)
+        git clone --quiet "https://github.com/$repo" "$RUNNER_TEMP/mp-skills"
+        git -C "$RUNNER_TEMP/mp-skills" checkout --quiet "$ref"
+        # triage and implement can't be called through the Skill tool (disable-model-invocation), and the agent's
+        # Read tool reaches only the repo; the stage skills read them from here.
+        cp -r "$RUNNER_TEMP/mp-skills/skills/engineering" .factory/mp
+    # No caches: a cache saved here would be in the default branch's scope, which the repo's other workflows restore.
+    - if: inputs.node != ''
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: ${{ inputs.node }}
+    - if: inputs.python != ''
+      uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      with:
+        python-version: ${{ inputs.python }}
+    - if: inputs.install != ''
+      shell: bash
+      env:
+        INSTALL: ${{ inputs.install }}
+      # From factory.json on the default branch, on the default branch's lockfile: the PR branch's is never installed.
+      run: bash -c "$INSTALL"
+    - if: inputs.scrub == '1'
+      shell: bash
+      # The env scrub runs agent subprocesses under bubblewrap, with socat. The 26.04 image ships bubblewrap but not
+      # socat, so install only what is missing, and never start with `apt-get update`: it hung for minutes on mirror
+      # DNS failures (phase 0, check 3). Newer Ubuntu blocks the unprivileged user namespaces bubblewrap needs.
+      timeout-minutes: 5
+      run: |
+        missing=""; for p in bubblewrap socat; do command -v "${p/bubblewrap/bwrap}" >/dev/null || missing="$missing $p"; done
+        if [ -n "$missing" ]; then sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $missing; fi
+        if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; fi

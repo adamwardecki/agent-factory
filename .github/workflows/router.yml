@@ -1,0 +1,52 @@
+name: factory router
+
+# The router, called by the target repo's factory-router.yml on every trigger. Caller interface 1.
+
+on:
+  workflow_call:
+    inputs:
+      interface: { type: number, required: true }
+      dry_run: { type: string, required: false, default: '1' }
+      paused: { type: string, required: false, default: '' }
+    secrets:
+      FACTORY_SIGNING_KEY: { required: true }
+
+jobs:
+  route:
+    # Only events the router could act on get past this. A skipped job doesn't enter the concurrency group, so other
+    # comments and labels in a busy repo cost nothing and push nothing out of it. No login appears here: who may do
+    # what is in factory.json, which a workflow expression can't read, so router/main.ts checks the actor.
+    if: >-
+      github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' && github.event.label.name == 'agent:queued' && !endsWith(github.actor, '[bot]')) ||
+      (github.event_name == 'issue_comment' && !endsWith(github.actor, '[bot]') &&
+      (startsWith(github.event.comment.body, '/approve') || startsWith(github.event.comment.body, '/stop') || startsWith(github.event.comment.body, '/retry'))) ||
+      (github.event_name == 'pull_request_review' && github.event.review.state == 'changes_requested' &&
+      startsWith(github.event.pull_request.head.ref, 'factory/issue-') && github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'pull_request_target' && startsWith(github.event.pull_request.head.ref, 'factory/issue-') &&
+      github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # One router at a time per repo, so two runs can't both fill the last slot. queue: max keeps every waiting run
+    # (up to 100) instead of replacing the pending one; the router doesn't depend on that, since it rebuilds
+    # everything from GitHub each time. actionlint doesn't know the key yet.
+    concurrency: { group: 'factory-router-${{ github.repository }}', cancel-in-progress: false, queue: max }
+    # contents: write is what markPullRequestReadyForReview needs, from any run (phase 0, check 7: with contents: read
+    # the mutation is refused, and the review request still works). This job runs factory code only: it checks out the
+    # factory repo, never the target repo.
+    permissions: { contents: write, issues: write, pull-requests: write, actions: write }
+    steps:
+      - name: Check the caller interface
+        env: { INTERFACE: '${{ inputs.interface }}' }
+        run: '[[ "$INTERFACE" == "1" ]] || { echo "::error::This agent-factory release speaks caller interface 1, not $INTERFACE. Re-render the caller workflows for the release you pin."; exit 1; }'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { repository: '${{ job.workflow_repository }}', ref: '${{ job.workflow_sha }}', persist-credentials: false }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version: 24.x }
+      - run: node --no-warnings router/main.ts
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          FACTORY_SIGNING_KEY: ${{ secrets.FACTORY_SIGNING_KEY }}
+          FACTORY_DRY_RUN: ${{ inputs.dry_run }}
+          FACTORY_PAUSED: ${{ inputs.paused }}
+          FACTORY_AUTH_MODE: oauth_token
