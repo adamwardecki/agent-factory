@@ -80,6 +80,9 @@ function command(v: unknown, field: string, required: boolean): string | null {
   if ([...s].some(isControl) || s !== s.trim() || s.length > 200) {
     throw new ConfigError(`${field} must be one line of at most 200 characters, with no control characters or surrounding spaces`);
   }
+  // A command becomes `Bash(<command>)` in a comma-separated list inside one quoted CLI argument. These characters
+  // would end the entry or the quote early and let a value add allow rules; put such a command in a script instead.
+  if (/["\\,()]/.test(s)) throw new ConfigError(`${field} may not contain " \\ , ( or ): wrap it in a script and run that`);
   return s;
 }
 
@@ -176,7 +179,12 @@ export function parseRepoConfig(raw: unknown, authMode: AuthMode = 'oauth_token'
     },
     riskyPaths: [...BASELINE_RISKY, ...(node ? TOOLCHAIN_RISKY.node : []), ...(python ? TOOLCHAIN_RISKY.python : []), ...own],
     prSkill: optString(raw.prSkill, 'prSkill'),
-    models: perStage(raw.models, 'models', DEFAULT_MODELS, (x, f) => optString(x, f) ?? fail(`${f} must be a non-empty string`)),
+    models: perStage(raw.models, 'models', DEFAULT_MODELS, (x, f) => {
+      const m = optString(x, f) ?? fail(`${f} must be a non-empty string`);
+      // The name goes into `--model <name>` unquoted.
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(m)) throw new ConfigError(`${f} must be a model name: letters, digits and . _ : / -`);
+      return m;
+    }),
     maxTurns: perStage(raw.maxTurns, 'maxTurns', DEFAULT_TURNS, (x, f) => int(x, f, 1, 500, 1)),
     limits: {
       maxRounds: int(limits.maxRounds, 'limits.maxRounds', 1, 10, DEFAULT_LIMITS.maxRounds),

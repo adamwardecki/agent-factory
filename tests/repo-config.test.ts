@@ -81,6 +81,20 @@ test('no setting may hold a newline or other control character: they reach job o
   }
 });
 
+test('commands and model names cannot break the quoting of the allowed-tools list', () => {
+  // Commands become `Bash(<command>)` entries in a comma-separated list inside a quoted CLI argument.
+  for (const bad of ['npm test "x"', 'npm test \\ x', 'a, Bash(curl:*)', 'npm run (x)', 'sh -c "a"']) {
+    assert.throws(() => parseRepoConfig({ ...minimal, commands: { test: bad } }), /commands\.test/, bad);
+  }
+  for (const good of ['npm test', 'make test', 'pytest -q', 'go test ./...', 'node --no-warnings --test tests/*.test.ts', 'cargo test --workspace']) {
+    assert.doesNotThrow(() => parseRepoConfig({ ...minimal, commands: { test: good } }), good);
+  }
+  for (const bad of ['claude opus', 'claude-opus-5-5 --dangerously-skip-permissions', 'a"b', 'a,b']) {
+    assert.throws(() => parseRepoConfig({ ...minimal, models: { plan: bad } }), /models\.plan/, bad);
+  }
+  assert.doesNotThrow(() => parseRepoConfig({ ...minimal, models: { plan: 'claude-opus-5-5', build: 'claude-sonnet-5-5' } }));
+});
+
 test('commands may not hold control characters or surrounding whitespace', () => {
   for (const bad of ['npm\u0000test', 'npm\ttest\u2028x', ' npm test', 'npm test ']) assert.throws(() => parseRepoConfig({ ...minimal, commands: { test: bad } }), /commands\.test/, JSON.stringify(bad));
 });
