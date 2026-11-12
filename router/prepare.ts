@@ -26,6 +26,11 @@ export type Prepared = { workflow: RunWorkflow; attempt: string; defaultBranch: 
 export function outputs(p: Prepared, config: RepoConfig): Record<string, string> {
   const gated = gatedHead(p.state, p.workflow);
   const c = config.commands;
+  const checked = (o: Record<string, string>): Record<string, string> => {
+    // Each output is one `name=value` line of $GITHUB_OUTPUT; a newline in a value would write another output.
+    for (const [k, v] of Object.entries(o)) if (/[\r\n]/.test(v)) throw new Error(`the ${k} output has a line break`);
+    return o;
+  };
   const common = {
     attempt: p.attempt,
     'default-branch': p.defaultBranch,
@@ -37,9 +42,9 @@ export function outputs(p: Prepared, config: RepoConfig): Record<string, string>
     node: config.toolchain.node ?? '',
     python: config.toolchain.python ?? '',
   };
-  if (p.workflow === 'verify') return { ...common, install: c.install ?? '', test: c.test, lint: c.lint ?? '', typecheck: c.typecheck ?? '' };
+  if (p.workflow === 'verify') return checked({ ...common, install: c.install ?? '', test: c.test, lint: c.lint ?? '', typecheck: c.typecheck ?? '' });
   const runsCode = p.workflow === 'build' || p.workflow === 'fix';
-  return {
+  return checked({
     ...common,
     model: config.models[p.workflow],
     'max-turns': String(config.maxTurns[p.workflow]),
@@ -47,7 +52,7 @@ export function outputs(p: Prepared, config: RepoConfig): Record<string, string>
     // The planner runs no code and reads the issue with gh, which the scrub would break.
     scrub: p.workflow === 'plan' ? '' : '1',
     install: runsCode ? (c.install ?? '') : '',
-  };
+  });
 }
 
 async function context(gh: Gh, issue: number, key: string, p: Prepared, config: RepoConfig, comments: Awaited<ReturnType<typeof listComments>>): Promise<string | null> {

@@ -71,6 +71,16 @@ test('the risky baseline covers GLOSSARY and CONTEXT files by pattern, and go is
   assert.throws(() => parseRepoConfig({ ...minimal, version: undefined }), /version is missing/);
 });
 
+test('no setting may hold a newline or other control character: they reach job outputs and prompts', () => {
+  for (const bad of ['24.x\nevil=1', 'a\u0000b', 'x\u2028y']) {
+    assert.throws(() => parseRepoConfig({ ...minimal, toolchain: { node: bad } }), /toolchain\.node/, JSON.stringify(bad));
+    assert.throws(() => parseRepoConfig({ ...minimal, toolchain: { python: bad } }), /toolchain\.python/);
+    assert.throws(() => parseRepoConfig({ ...minimal, models: { plan: bad } }), /models\.plan/);
+    assert.throws(() => parseRepoConfig({ ...minimal, defaultBranch: bad }), /defaultBranch/);
+    assert.throws(() => parseRepoConfig({ ...minimal, prSkill: bad }), /prSkill/);
+  }
+});
+
 test('commands may not hold control characters or surrounding whitespace', () => {
   for (const bad of ['npm\u0000test', 'npm\ttest\u2028x', ' npm test', 'npm test ']) assert.throws(() => parseRepoConfig({ ...minimal, commands: { test: bad } }), /commands\.test/, JSON.stringify(bad));
 });

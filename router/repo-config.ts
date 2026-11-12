@@ -51,17 +51,20 @@ const DEFAULT_MODELS: Record<StageWorkflow, string> = { plan: 'claude-opus-5-5',
 const DEFAULT_TURNS: Record<StageWorkflow, number> = { plan: 60, build: 150, review: 60, fix: 100 };
 const DEFAULT_LIMITS: Limits = { maxRounds: 3, maxRebases: 2, maxAttempts: 2, maxActive: 1 };
 
-function optString(v: unknown, field: string): string | null {
-  if (v === undefined || v === null) return null;
-  if (typeof v !== 'string' || v.trim() === '') throw new ConfigError(`${field} must be a non-empty string`);
-  return v;
-}
-
 // C0 and C1 controls, DEL, and the two Unicode line separators.
 const isControl = (ch: string): boolean => {
   const code = ch.codePointAt(0) ?? 0;
   return code < 0x20 || (code >= 0x7f && code <= 0x9f) || code === 0x2028 || code === 0x2029;
 };
+
+function optString(v: unknown, field: string): string | null {
+  if (v === undefined || v === null) return null;
+  if (typeof v !== 'string' || v.trim() === '') throw new ConfigError(`${field} must be a non-empty string`);
+  // These values become job outputs (`name=value` lines), prompts and workflow inputs. A newline would write another
+  // output; any control character has no business in a name or a version.
+  if ([...v].some(isControl)) throw new ConfigError(`${field} must not contain control characters or line breaks`);
+  return v;
+}
 
 // Commands become Bash allow rules, the agents' Checks list and the verify job's steps; one line each, so a value
 // can't smuggle a second command. There is no CI workflow setting: the factory runs these commands itself (verify),
@@ -107,7 +110,7 @@ export function parseAuthMode(v: string | undefined): AuthMode {
 const TOP_FIELDS = ['$schema', 'version', 'roles', 'concurrency', 'defaultBranch', 'toolchain', 'commands', 'riskyPaths', 'prSkill', 'models', 'maxTurns', 'limits'];
 
 // An optional section of the config. Missing is empty; anything but an object is an error, because ignoring
-  // `toolchain: "node"` would silently drop the node manifests from the risky paths.
+// `toolchain: "node"` would silently drop the node manifests from the risky paths.
 function section(raw: Record<string, unknown>, name: string): Record<string, unknown> {
   const v = raw[name];
   if (v === undefined) return {};

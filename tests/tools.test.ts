@@ -16,12 +16,15 @@ test('the planner reads, writes only .factory, and can only view issues', () => 
   assert.deepEqual(allowedTools('plan', config), ['Read(./**)', 'Grep', 'Glob', 'Edit(./.factory/**)', 'Skill', 'Bash(gh issue view:*)']);
 });
 
-test('build and fix get git and exactly the configured commands', () => {
+test('build and fix get a list of git subcommands and exactly the configured commands', () => {
   const tools = allowedTools('build', config);
   assert.ok(tools.includes('Bash(npm test)'));
   assert.ok(tools.includes('Bash(npm run lint)'));
   assert.ok(tools.includes('Bash(node --test:*)'));
-  assert.ok(tools.includes('Bash(git:*)'));
+  for (const sub of ['add', 'commit', 'switch', 'rebase', 'bundle', 'status', 'diff', 'log']) assert.ok(tools.includes(`Bash(git ${sub}:*)`), sub);
+  // Not all of git: no push or fetch (no credentials, and the stages must not need them), no config, remote or clone.
+  assert.ok(!tools.includes('Bash(git:*)'));
+  for (const sub of ['push', 'fetch', 'pull', 'config', 'remote', 'clone', 'submodule']) assert.ok(!tools.includes(`Bash(git ${sub}:*)`), sub);
   assert.ok(!tools.some((t) => t.startsWith('Bash(gh')), 'no gh: agents write files, the publish job writes to GitHub');
   assert.ok(!tools.includes('Bash(npm ci)'), 'the agent cannot reinstall');
   assert.deepEqual(allowedTools('fix', config), tools);
@@ -37,6 +40,11 @@ test('the reviewer reads, diffs and writes only .factory', () => {
 const SHA = (c: string) => c.repeat(40);
 const state: FactoryState = { stage: 'fixing', since: '2026-11-09T11:00:00Z', round: 1, attempts: 0, runs: [], pr: 51, fixReason: 'rebase', gatedSha: SHA('a'), attempt: 'mhs1abc' };
 const prepared = { attempt: 'mhs1abc', defaultBranch: 'main', baseSha: SHA('b'), branchSha: SHA('a'), state };
+
+test('an output value with a newline is refused, so no setting can write another output', () => {
+  const evil = { ...config, toolchain: { node: '24.x\nscrub=', python: null } };
+  assert.throws(() => outputs({ ...prepared, workflow: 'build', state: { ...state, stage: 'building' } }, evil), /node/);
+});
 
 test('prepare hands the publish job the stage\'s immutable inputs as outputs', () => {
   const o = outputs({ ...prepared, workflow: 'fix' }, config);

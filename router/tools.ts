@@ -7,6 +7,11 @@ import type { StageWorkflow } from './config.ts';
 import type { RepoConfig } from './repo-config.ts';
 
 const READ = ['Read(./**)', 'Grep', 'Glob'];
+
+// What build and fix need from git, one subcommand at a time. Not all of git: no push or fetch (the stages hold no
+// credentials, and must not need any), no config, remote, clone or submodule.
+const GIT_WRITE = ['add', 'rm', 'mv', 'commit', 'switch', 'checkout', 'restore', 'reset', 'rebase', 'cherry-pick', 'stash', 'bundle'];
+const GIT_READ = ['status', 'diff', 'log', 'show', 'rev-parse', 'ls-files', 'branch', 'merge-base'];
 // Covers the Write tool too: plan and review can create files under .factory/ and nowhere else.
 const SCRATCH = 'Edit(./.factory/**)';
 
@@ -21,7 +26,7 @@ export function allowedTools(stage: StageWorkflow, config: RepoConfig): string[]
     case 'fix': {
       const commands = [c.test, c.lint, c.typecheck].flatMap((x) => (x ? [`Bash(${x})`] : []));
       const perFile = c.testFile ? [`Bash(${c.testFile}:*)`] : [];
-      return [...READ, 'Edit', 'Write', 'Skill', 'Agent', 'Bash(git:*)', ...commands, ...perFile];
+      return [...READ, 'Edit', 'Write', 'Skill', 'Agent', ...[...GIT_WRITE, ...GIT_READ].map((g) => `Bash(git ${g}:*)`), ...commands, ...perFile];
     }
   }
 }
