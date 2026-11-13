@@ -65,11 +65,19 @@ jobs:
         with: { ref: '${{ needs.prepare.outputs.base-sha }}', fetch-depth: 0, persist-credentials: false }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { repository: '${{ job.workflow_repository }}', ref: '${{ job.workflow_sha }}', path: .factory-src, persist-credentials: false }
+      # Here, not in agent-setup: both have post steps, and agent-setup's directory leaves the workspace below.
+      # No caches: a cache saved here would be in the default branch's scope, which the repo's other workflows restore.
+      - if: needs.prepare.outputs.node != ''
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ needs.prepare.outputs.node }}
+      - if: needs.prepare.outputs.python != ''
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ needs.prepare.outputs.python }}
       - uses: ./.factory-src/actions/agent-setup
         with:
           stage: ${{ inputs.stage }}
-          node: ${{ needs.prepare.outputs.node }}
-          python: ${{ needs.prepare.outputs.python }}
           install: ${{ needs.prepare.outputs.install }}
           scrub: ${{ needs.prepare.outputs.scrub }}
       # The factory's code leaves the workspace before the agent starts: the repo's lint must not trip over it, and

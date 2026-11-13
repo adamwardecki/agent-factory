@@ -271,3 +271,15 @@ test('composite action steps use only the keys a composite action supports', () 
     }
   }
 });
+
+test('agent-setup uses no action with a post step: its directory has left the workspace by then', () => {
+  // The runner reads a composite action's action.yml again for its post steps. The agent job moves .factory-src out
+  // before Claude starts, so a nested setup-node there failed the job after Claude had finished (sandbox trial, run 2).
+  const uses = [...read('actions/agent-setup/action.yml').matchAll(/uses: ([^@\s]+)@/g)].map((m) => m[1]);
+  assert.deepEqual(uses, ['actions/download-artifact']);
+  const stage = read('.github/workflows/stage.yml');
+  const at = (s: string) => stage.indexOf(s);
+  for (const setup of ['actions/setup-node@', 'actions/setup-python@']) {
+    assert.ok(at(setup) > 0 && at(setup) < at('uses: ./.factory-src/actions/agent-setup'), `${setup} runs in the job, before agent-setup's install`);
+  }
+});
