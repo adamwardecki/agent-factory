@@ -53,8 +53,8 @@ runs:
       # The env scrub runs agent subprocesses under bubblewrap, with socat. The 26.04 image ships bubblewrap but not
       # socat, so install only what is missing, and never start with `apt-get update`: it hung for minutes on mirror
       # DNS failures (phase 0, check 3). Newer Ubuntu blocks the unprivileged user namespaces bubblewrap needs.
-      timeout-minutes: 5
+      # A composite step can't take timeout-minutes, so the install carries its own timeout.
       run: |
         missing=""; for p in bubblewrap socat; do command -v "${p/bubblewrap/bwrap}" >/dev/null || missing="$missing $p"; done
-        if [ -n "$missing" ]; then sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $missing; fi
+        if [ -n "$missing" ]; then sudo DEBIAN_FRONTEND=noninteractive timeout 300 apt-get install -y --no-install-recommends $missing; fi
         if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; fi

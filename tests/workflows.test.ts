@@ -124,10 +124,13 @@ test('packages are installed only when missing, and apt never starts with an upd
     const lines = read(f).split('\n');
     const code = lines.filter((l) => !l.trim().startsWith('#'));
     assert.ok(!code.some((l) => l.includes('apt-get update')), `${f}: apt-get update hung for minutes on mirror DNS failures`);
-    // The step that installs has its own timeout, a few lines above its command.
+    // The install has a timeout: in a workflow, on its step, a few lines above the command; in a composite action,
+    // whose steps can't take timeout-minutes, on the command itself.
+    const composite = f.startsWith('actions/');
     lines.forEach((l, n) => {
       if (l.includes('apt-get install') && !l.trim().startsWith('#')) {
-        assert.ok(lines.slice(Math.max(0, n - 6), n).some((x) => x.includes('timeout-minutes: 5')), `${f}:${n + 1}: an apt step needs a timeout`);
+        const timed = composite ? /\btimeout \d+ apt-get install/.test(l) : lines.slice(Math.max(0, n - 6), n).some((x) => x.includes('timeout-minutes: 5'));
+        assert.ok(timed, `${f}:${n + 1}: an apt install needs a timeout`);
       }
     });
   }
@@ -254,5 +257,17 @@ test('the last job of a stage run reports unless the run itself was cancelled', 
     const yml = read(f);
     assert.doesNotMatch(yml, /always\(\)/, f);
     assert.match(yml, /if: \$\{\{ !cancelled\(\) && needs\.prepare\.result == 'success' \}\}/, f);
+  }
+});
+
+test('composite action steps use only the keys a composite action supports', () => {
+  // GitHub refuses to load a composite action with a job-step-only key such as timeout-minutes (sandbox trial, run 1).
+  const allowed = new Set(['name', 'id', 'if', 'run', 'shell', 'uses', 'with', 'env', 'working-directory', 'continue-on-error']);
+  for (const f of ['actions/prepare/action.yml', 'actions/agent-setup/action.yml', 'actions/publish/action.yml']) {
+    const steps = read(f).split(/^ {4}- /m).slice(1);
+    for (const step of steps) {
+      const keys = [...`  ${step}`.matchAll(/^ {6}([a-z-]+):/gm)].map((m) => m[1] ?? '');
+      for (const k of keys) assert.ok(allowed.has(k), `${f}: ${k}`);
+    }
   }
 });
