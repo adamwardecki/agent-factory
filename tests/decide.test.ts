@@ -149,11 +149,20 @@ test('runs for another stage or attempt, still going, cancelled or already seen 
   const s = snap(st('building'), { pr: pr() });
   assert.deepEqual(finished(s, run('plan')), []);
   assert.deepEqual(finished(s, run('build', 'success', { completedAt: null })), []);
-  assert.deepEqual(finished(s, run('build', 'cancelled')), []);
+  assert.deepEqual(finished(s, run('build', 'skipped')), []);
+  assert.deepEqual(finished(s, run('build', 'cancelled', { attempt: 'old' })), [], 'a run the router cancelled when it left that attempt');
   assert.deepEqual(finished(s, run('build', 'success', { attempt: 'old' })), []);
   assert.deepEqual(finished(s, run('build', 'success', { attempt: null })), []);
   const seen = snap(st('building', { runs: ['https://example.test/runs/build-success'] }), { pr: pr() });
   assert.deepEqual(finished(seen, run('build')), []);
+});
+
+test('a run of the current attempt that was cancelled counts as failed: a job that hits its timeout looks like that', () => {
+  const a = finished(snap(st('building'), { pr: pr() }), run('build', 'cancelled'));
+  assert.equal(saves(a)[0]?.attempts, 1);
+  assert.ok(saves(a)[0]?.failedAt);
+  const v = finished(snap(st('ci', { pr: 51, gatedSha: HEAD }), { pr: pr() }), run('verify', 'cancelled'));
+  assert.equal(saves(v)[0]?.attempts, 1);
 });
 
 test('a build that opened a signed PR goes to verify on its head', () => {
@@ -233,6 +242,14 @@ test('a fix that pushed goes back to CI; one that pushed nothing is a failed att
   assert.equal(saves(idle)[0]?.attempts, 1);
 });
 
+test('a fix whose push GitHub has not yet put on the PR waits instead of failing', () => {
+  const lagging = snap(st('fixing', { pr: 51, headSha: 'sha-1' }), { pr: pr({ branchSha: 'sha-2' }) });
+  assert.deepEqual(finished(lagging, run('fix')), []);
+  assert.deepEqual(sweep([{ ...lagging, lastRun: run('fix') }], ctx), []);
+  const idle = snap(st('fixing', { pr: 51, headSha: 'sha-1' }), { pr: pr({ branchSha: 'sha-1' }) });
+  assert.equal(saves(finished(idle, run('fix')))[0]?.attempts, 1);
+});
+
 const cmd = (s: IssueSnapshot, command: 'approve' | 'stop' | 'retry', actor = 'adamwardecki') =>
   decideEvent({ kind: 'command', issue: 7, command, actor }, s, ctx);
 
@@ -295,6 +312,23 @@ test('the sweep retries a failed stage after an hour and keeps the attempt count
   assert.deepEqual(dispatches(a), ['build']);
   assert.equal(saves(a)[0]?.attempts, 1);
   assert.equal(saves(a)[0]?.failedAt, undefined);
+});
+
+test('the sweep marks a ready PR that is still a draft: the first attempt failed after the state was saved', () => {
+  const s = snap(st('ready', { pr: 51, queuedBy: 'alice' }), { pr: pr({ draft: true }) });
+  const a = sweep([s], ctx);
+  assert.deepEqual(a.filter((x) => x.kind === 'pr-ready'), [{ kind: 'pr-ready', issue: 7, pr: 51, reviewer: 'alice' }]);
+  assert.deepEqual(sweep([snap(st('ready', { pr: 51 }), { pr: pr({ draft: false }) })], ctx), []);
+  assert.deepEqual(sweep([snap(st('ready', { pr: 51 }), { pr: pr({ draft: true, open: false }) })], ctx).filter((x) => x.kind === 'pr-ready'), []);
+});
+
+test('the sweep dispatches an attempt again when no run for it shows up after ten minutes', () => {
+  const lost = snap(st('building', { attempt: 'a9', since: '2026-11-09T11:40:00.000Z' }));
+  const a = sweep([lost], ctx);
+  assert.deepEqual(a, [{ kind: 'dispatch', issue: 7, workflow: 'build', attempt: 'a9' }]);
+  assert.deepEqual(sweep([snap(st('building', { since: '2026-11-09T11:55:00.000Z' }))], ctx), [], 'too soon');
+  assert.deepEqual(stages(sweep([snap(st('building', { since: '2026-11-09T10:00:00.000Z' }))], ctx)), ['blocked'], 'after 90 minutes it is stuck, not retried');
+  assert.deepEqual(sweep([snap(st('building', { since: '2026-11-09T11:40:00.000Z' }), { lastRun: run('build', null, { completedAt: null }) })], ctx), [], 'a run exists');
 });
 
 test('the sweep processes a finished run whose event was missed', () => {
@@ -531,9 +565,10 @@ test('a sweep retry restarts the stage clock', () => {
 });
 
 test('the sweep ignores a /stop from before the stage began, and commands by anyone else', () => {
-  const old = snap(st('building'), { lastCommand: { command: 'stop', at: '2026-11-09T10:10:00Z', actor: 'adamwardecki' } });
+  const going = { lastRun: run('build', null, { completedAt: null }) };
+  const old = snap(st('building'), { ...going, lastCommand: { command: 'stop', at: '2026-11-09T10:10:00Z', actor: 'adamwardecki' } });
   assert.deepEqual(sweep([old], ctx), []);
-  const other = snap(st('building'), { lastCommand: { command: 'stop', at: '2026-11-09T11:10:00Z', actor: 'someone' } });
+  const other = snap(st('building'), { ...going, lastCommand: { command: 'stop', at: '2026-11-09T11:10:00Z', actor: 'someone' } });
   assert.deepEqual(sweep([other], ctx), []);
 });
 
@@ -696,14 +731,14 @@ test('the router records the CI run it acted on', () => {
 // A changes-requested review the router missed
 
 test('the sweep recovers the maintainer\'s changes-requested review on a ready PR', () => {
-  const at = (t: string, actor = 'adamwardecki') => ({ lastChangesRequested: { at: t, actor }, pr: pr() });
+  const at = (t: string, actor = 'adamwardecki') => ({ lastChangesRequested: { at: t, actor }, pr: pr({ draft: false }) });
   const a = sweep([snap(st('ready', { pr: 51 }), at('2026-11-09T11:30:00Z'))], ctx);
   assert.deepEqual(stages(a), ['fixing']);
   assert.equal(saves(a)[0]?.fixReason, 'maintainer');
   assert.deepEqual(sweep([snap(st('ready', { pr: 51 }), at('2026-11-09T10:30:00Z'))], ctx), []);
   assert.deepEqual(sweep([snap(st('ready', { pr: 51 }), at('2026-11-09T11:30:00Z', 'someone'))], ctx), []);
-  assert.deepEqual(sweep([snap(st('in-review', { pr: 51 }), at('2026-11-09T11:30:00Z'))], ctx), []);
-  const risky = sweep([snap(st('ready', { pr: 51 }), { ...at('2026-11-09T11:30:00Z'), pr: pr(RISKY_PR) })], ctx);
+  assert.deepEqual(sweep([snap(st('in-review', { pr: 51 }), { ...at('2026-11-09T11:30:00Z'), lastRun: run('review', null, { completedAt: null }) })], ctx), []);
+  const risky = sweep([snap(st('ready', { pr: 51 }), { ...at('2026-11-09T11:30:00Z'), pr: pr({ ...RISKY_PR, draft: false }) })], ctx);
   assert.deepEqual(stages(risky), ['awaiting-approval']);
 });
 

@@ -146,6 +146,10 @@ Three files. None of them contains factory logic.
   `Bash(npm test)`. `commands.extra` lists further commands, allowed exactly as written, for build and fix. No
   other command can run. The allowlist limits what the agent types; it doesn't contain what a test does once it
   runs. The read-only token and the environment scrub do that.
+- **Sandbox home:** verify runs install, typecheck, lint and test as separate sandboxed commands that share one
+  home directory for the job, so a `pip install --user` or a tool cache from the install is still there for the
+  test. The runner's tool cache is read-only, so a Python repo should install into a virtualenv in the workspace
+  (`python -m venv .venv && .venv/bin/pip install -r requirements.txt`, and `.venv/bin/pytest` as the test command).
 - **Toolchain setup:** `toolchain` covers the built-in setups (`node`, `python`, `go`). For anything else (Rust, a
   monorepo, a test database), the agent job also runs the repo's own composite action at the fixed path
   `.github/actions/factory-setup`, if it exists. It runs from the default branch's checkout, before the switch to

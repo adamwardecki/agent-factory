@@ -90,7 +90,7 @@ jobs:
 
   report:
     needs: [prepare, verify]
-    if: always() && needs.prepare.result == 'success'
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: { actions: write }

@@ -103,7 +103,7 @@ jobs:
 
   publish:
     needs: [prepare, agent]
-    if: always() && needs.prepare.result == 'success'
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions: { contents: write, issues: write, pull-requests: write, actions: write }

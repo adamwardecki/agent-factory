@@ -73,9 +73,9 @@ export type Write =
 
 const SHA = /^[0-9a-f]{40}$/;
 
-function bundleTip(files: Files, git: Git, base: string): string {
+function bundleTip(files: Files, git: Git, base: string, carried: string | null = null): string {
   if (files.size('branch.bundle') > MAX_BUNDLE_BYTES) throw new ContractError(`branch.bundle is larger than ${MAX_BUNDLE_BYTES} bytes`);
-  return checkBundle(git, files.path('branch.bundle'), base).tip;
+  return checkBundle(git, files.path('branch.bundle'), base, { carried }).tip;
 }
 
 // Everything the stage will write, or a ContractError. No network, no remote change.
@@ -111,7 +111,8 @@ export function collect(i: PublishInput, key: string, files: Files, git: Git): W
       if (i.pr === null || i.gatedSha === null) throw new ContractError('the fix stage has no PR or branch head recorded');
       const note = inert(checkText(files.read('fix.md'), 'fix.md'));
       // A fix builds on the head the router checked, unless it is a rebase onto the default branch.
-      const tip = bundleTip(files, git, i.fixReason === 'rebase' ? i.baseSha : i.gatedSha);
+      const rebase = i.fixReason === 'rebase';
+      const tip = bundleTip(files, git, rebase ? i.baseSha : i.gatedSha, rebase ? i.gatedSha : null);
       return [
         { kind: 'push', branch, tip, expect: i.gatedSha },
         { kind: 'comment', on: i.pr, sig: 'fix', body: signed('fix', note) },

@@ -84,3 +84,17 @@ test('the sweep reads a run that is still going as unfinished', () => {
   assert.equal(done?.completedAt, '2026-11-10T10:04:00Z');
   assert.equal(done?.conclusion, 'success');
 });
+
+test('a run whose jobs have all finished counts as finished before the run itself reads completed', () => {
+  const allDone = [
+    { name: 'verify / prepare', conclusion: 'success', status: 'completed' },
+    { name: 'verify / verify', conclusion: 'failure', status: 'completed' },
+    { name: 'verify / report', conclusion: 'success', status: 'completed' },
+  ];
+  const s = runSnapshot({ ...run, display_title: 'factory-verify #49 mhs1abc', status: 'in_progress' }, allDone, 'o/r', NOW);
+  assert.equal(s?.conclusion, 'failure');
+  assert.ok(s?.completedAt);
+  // Without the reporting job there is nothing to go on, and a job still running means the run is not over.
+  assert.equal(runSnapshot({ ...run, display_title: 'factory-verify #49 mhs1abc', status: 'in_progress' }, allDone.slice(0, 2), 'o/r', NOW)?.completedAt, null);
+  assert.equal(runSnapshot({ ...run, display_title: 'factory-verify #49 mhs1abc', status: 'in_progress' }, [...allDone.slice(0, 2), { name: 'verify / report', conclusion: null, status: 'in_progress' }], 'o/r', NOW)?.completedAt, null);
+});

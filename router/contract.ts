@@ -88,12 +88,16 @@ export type Git = (args: string[]) => string;
 // No hooks, whatever the clone's config says: the publish job runs factory code only.
 export const gitIn = (cwd: string): Git => (args) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
+const SHA = /^[0-9a-f]{40}$/;
 const IDENT = `${BOT_NAME} <${BOT_EMAIL}>`;
 export const INCOMING = 'refs/factory/incoming';
 
 // The agent's commits, as a bundle on top of `base`. The bundle's one ref is fetched into refs/factory/incoming of
 // the publish job's clone, with object checks on, and is never checked out. Returns its tip.
-export function checkBundle(git: Git, bundle: string, base: string): { tip: string } {
+// `carried` is the old head of the branch in a rebase round: a rebase keeps each commit's author and message, so
+// commits whose author and message the old head already had (a maintainer's "Commit suggestion", say) are not the
+// agent's and are not held to the agent's rules. Their committer is still the bot, since the rebase made it so.
+export function checkBundle(git: Git, bundle: string, base: string, opts: { carried?: string | null } = {}): { tip: string } {
   const ok = (args: string[]) => {
     try {
       git(args);
@@ -102,7 +106,7 @@ export function checkBundle(git: Git, bundle: string, base: string): { tip: stri
       return false;
     }
   };
-  if (!/^[0-9a-f]{40}$/.test(base)) throw new ContractError(`the base ${JSON.stringify(base)} is not a commit SHA`);
+  if (!SHA.test(base)) throw new ContractError(`the base ${JSON.stringify(base)} is not a commit SHA`);
   if (!ok(['bundle', 'verify', bundle])) throw new ContractError('the bundle does not verify against this repo');
   if (!ok(['-c', 'transfer.fsckObjects=true', 'fetch', '--no-tags', '-q', bundle, `+HEAD:${INCOMING}`])) throw new ContractError('the bundle could not be read, or its objects failed the checks');
   const tip = git(['rev-parse', INCOMING]);
@@ -125,12 +129,24 @@ export function checkBundle(git: Git, bundle: string, base: string): { tip: stri
   // Commit messages end up in the squash-merge message: a closing keyword would close someone else's issue when the
   // PR merges, and a Co-authored-by trailer would credit someone who did not write it. They can't be rewritten (that
   // would change the commits), so they are refused, and the agent words them again.
-  for (const message of git(['log', '--format=%B%x00', range]).split('\0')) {
-    if (CLOSING.test(message)) throw new ContractError('a commit message contains a closing keyword for an issue or PR; say "Refs #n" instead');
-    if (/^co-authored-by:/im.test(message)) throw new ContractError('a commit message has a Co-authored-by trailer; the factory\'s commits have one author');
+  const commits = (rev: string) =>
+    git(['log', '--format=%an <%ae>%x01%cn <%ce>%x01%B%x00', rev])
+      .split('\0')
+      .filter((c) => c.trim() !== '')
+      .map((c) => {
+        const [author = '', committer = '', ...message] = c.replace(/^\n/, '').split('\x01');
+        return { author, committer, message: message.join('\x01') };
+      });
+  const carried = new Set<string>();
+  if (opts.carried && SHA.test(opts.carried) && ok(['cat-file', '-e', `${opts.carried}^{commit}`])) {
+    for (const c of commits(opts.carried)) carried.add(`${c.author}\x01${c.message}`);
   }
-  const idents = git(['log', '--format=%an <%ae>%x00%cn <%ce>', range]).split('\n').flatMap((l) => l.split('\0'));
-  const stranger = idents.find((i) => i !== IDENT);
-  if (stranger) throw new ContractError(`a commit's author or committer is ${stranger}, not ${IDENT}`);
+  for (const c of commits(range)) {
+    if (c.committer !== IDENT) throw new ContractError(`a commit's committer is ${c.committer}, not ${IDENT}`);
+    if (carried.has(`${c.author}\x01${c.message}`)) continue;
+    if (CLOSING.test(c.message)) throw new ContractError('a commit message contains a closing keyword for an issue or PR; say "Refs #n" instead');
+    if (/^co-authored-by:/im.test(c.message)) throw new ContractError('a commit message has a Co-authored-by trailer; the factory\'s commits have one author');
+    if (c.author !== IDENT) throw new ContractError(`a commit's author is ${c.author}, not ${IDENT}`);
+  }
   return { tip };
 }

@@ -42,7 +42,8 @@ export function runSnapshot(run: unknown, jobs: readonly Job[], repo: string, no
   const others = jobs.filter((j) => j.name !== last && !j.name.endsWith(` / ${last}`));
   const reporter = job(jobs, last);
   const reportable = reported !== undefined && reporter?.status === 'in_progress' && others.length > 0 && others.every((j) => j.status === 'completed');
-  const finished = done || reportable;
+  // Jobs can all be finished a moment before the run itself reads completed.
+  const finished = done || reportable || (reporter?.status === 'completed' && jobs.every((j) => j.status === 'completed'));
   return {
     issue: title.issue,
     workflow: title.workflow,

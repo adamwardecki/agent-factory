@@ -78,7 +78,14 @@ test('the verify job has a read-only token, no secrets and no caches, and sandbo
   assert.ok(verify.indexOf('mv .factory-src "$RUNNER_TEMP/factory-src"') < verify.indexOf(branchCheckout));
   const sandbox = read('scripts/sandboxed.sh');
   // env -i: pid 1 inside the PID namespace is bwrap itself, and /proc/1/environ would show the step's environment.
-  for (const flag of ['exec env -i PATH="$PATH" bwrap', '--clearenv', '--unshare-pid', '--tmpfs "$RUNNER_TEMP"', '--tmpfs "$HOME"', '--ro-bind / /']) assert.ok(sandbox.includes(flag), flag);
+  for (const flag of ['exec env -i PATH="$PATH" bwrap', '--clearenv', '--unshare-pid', '--tmpfs "$RUNNER_TEMP"', '--ro-bind / /']) assert.ok(sandbox.includes(flag), flag);
+  // Install and test are separate calls: what the install puts in the home (pip --user, tool caches) must still be
+  // there for the test. The home is a directory of its own that lives as long as the job, never the real one.
+  assert.ok(sandbox.includes('SANDBOX_HOME="$RUNNER_TEMP/sandbox-home"'));
+  assert.ok(sandbox.includes('--bind "$SANDBOX_HOME" "$HOME"'));
+  assert.doesNotMatch(sandbox, /--bind "\$HOME"/);
+  assert.ok(sandbox.indexOf('--bind "$SANDBOX_HOME" "$HOME"') < sandbox.indexOf('--bind "$GITHUB_WORKSPACE"'), 'the workspace is bound back in after the home');
+  assert.ok(sandbox.indexOf('--tmpfs "$RUNNER_TEMP"') > sandbox.indexOf('--bind "$SANDBOX_HOME" "$HOME"'), 'the temp directory (which holds the home on the host) is hidden last');
 });
 
 test('the reusable workflows check out their own pinned commit from the job context, not from inputs', () => {
@@ -237,5 +244,15 @@ test('the write identity is named in one place', () => {
   for (const f of readdirSync(new URL('../router', import.meta.url))) {
     if (f === 'config.ts') continue;
     assert.doesNotMatch(read(`router/${f}`), /github-actions\[bot\]'|41898282/, `router/${f}: use the constants in config.ts`);
+  }
+});
+
+test('the last job of a stage run reports unless the run itself was cancelled', () => {
+  // The router cancels the run of an attempt it has left; a report from that run would be about nothing. A job that
+  // timed out is not a cancelled run, so its report still goes out.
+  for (const f of ['.github/workflows/stage.yml', '.github/workflows/verify.yml']) {
+    const yml = read(f);
+    assert.doesNotMatch(yml, /always\(\)/, f);
+    assert.match(yml, /if: \$\{\{ !cancelled\(\) && needs\.prepare\.result == 'success' \}\}/, f);
   }
 });

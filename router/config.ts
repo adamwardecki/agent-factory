@@ -56,6 +56,8 @@ export function issueForBranch(branch: string): number | null {
 }
 
 export const RETRY_AFTER_MS = 60 * 60 * 1000;
+// A stage whose run has not shown up this long after it was entered is dispatched again.
+export const DISPATCH_RETRY_AFTER_MS = 10 * 60 * 1000;
 export const STUCK_AFTER_MS = 90 * 60 * 1000;
 
 // The version of the state comment's hidden data. A release reads this version and the one before it, and writes this

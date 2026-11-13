@@ -127,6 +127,40 @@ test('commit messages may not close issues or add co-authors: a squash merge wou
   assert.doesNotThrow(() => checkBundle(gitIn(ok.dir), ok.bundle(), ok.base));
 });
 
+test('a rebase round carries commits a person already put on the branch, but nothing new from anyone else', () => {
+  const maintainer = { ...process.env, GIT_AUTHOR_NAME: 'Maintainer', GIT_AUTHOR_EMAIL: 'm@example.com', GIT_COMMITTER_NAME: BOT_NAME, GIT_COMMITTER_EMAIL: BOT_EMAIL };
+  const r = repo();
+  r.commit('b.txt');
+  // GitHub's "Commit suggestion": the maintainer is the author, and the message may carry a co-author trailer.
+  writeFileSync(join(r.dir, 'c.txt'), 'suggested\n');
+  r.run(['add', '-A']);
+  r.run(['commit', '-qm', 'Apply suggestion\n\nCo-authored-by: Reviewer <rv@example.com>'], maintainer);
+  const old = r.run(['rev-parse', 'HEAD']);
+  r.run(['switch', '-q', 'main']);
+  writeFileSync(join(r.dir, 'main.txt'), 'moved on\n');
+  r.run(['add', '-A']);
+  r.run(['commit', '-qm', 'main moves']);
+  const newBase = r.run(['rev-parse', 'HEAD']);
+  r.run(['switch', '-q', 'work']);
+  r.run(['rebase', '-q', newBase]);
+  const bundle = join(r.dir, 'rebased.bundle');
+  r.run(['bundle', 'create', bundle, 'HEAD', '--not', newBase]);
+  assert.throws(() => checkBundle(gitIn(r.dir), bundle, newBase), /author|Co-authored-by/, 'a build round has no such commits');
+  assert.doesNotThrow(() => checkBundle(gitIn(r.dir), bundle, newBase, { carried: old }));
+  // A person's commit the old head did not have is not carried, and the committer is always the bot.
+  r.commit('d.txt', { author: 'Mallory' });
+  const more = join(r.dir, 'more.bundle');
+  r.run(['bundle', 'create', more, 'HEAD', '--not', newBase]);
+  assert.throws(() => checkBundle(gitIn(r.dir), more, newBase, { carried: old }), /Mallory/);
+  const stranger = repo();
+  stranger.commit('b.txt');
+  const oldStranger = stranger.run(['rev-parse', 'HEAD']);
+  stranger.run(['commit', '--amend', '-qm', 'same tree again'], { ...process.env, GIT_AUTHOR_NAME: 'Eve', GIT_AUTHOR_EMAIL: 'eve@example.com', GIT_COMMITTER_NAME: 'Eve', GIT_COMMITTER_EMAIL: 'eve@example.com' });
+  const eve = join(stranger.dir, 'eve.bundle');
+  stranger.run(['bundle', 'create', eve, 'HEAD', '--not', stranger.base]);
+  assert.throws(() => checkBundle(gitIn(stranger.dir), eve, stranger.base, { carried: oldStranger }), /committer|author/);
+});
+
 test('a bundle that does not build on the base, or a base that is not a SHA, is refused', () => {
   const r = repo();
   r.commit('b.txt');

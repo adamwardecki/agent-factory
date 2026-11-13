@@ -7,6 +7,7 @@ import {
   ACTIVE_STAGES,
   attemptId,
   branchFor,
+  DISPATCH_RETRY_AFTER_MS,
   RETRY_AFTER_MS,
   RUNNER_FOR,
   type RunWorkflow,
@@ -24,6 +25,8 @@ import { oneOf } from './util.ts';
 export type PullSnapshot = {
   number: number;
   headSha: string;
+  // What the branch itself points at. The PR's head can trail it for a moment after a push.
+  branchSha?: string;
   open: boolean;
   base: string; // the branch the PR targets; the factory's PRs target the default branch
   draft: boolean;
@@ -253,7 +256,9 @@ function runFinished(issue: number, st: FactoryState, snap: IssueSnapshot, run: 
   if (!expected || run.workflow !== expected || !run.completedAt || st.runs.includes(run.url)) return [];
   // Only the attempt the state names counts. A run from an earlier entry into the stage is stale, however late it ends.
   if (!st.attempt || run.attempt !== st.attempt) return [];
-  if (run.conclusion === 'cancelled' || run.conclusion === 'skipped') return [];
+  // Only a run the router cancelled itself is cancelled by anyone else's hand, and those belong to attempts it has
+  // already left (dropped above). A job that hits its timeout also reads as cancelled; that is a failed attempt.
+  if (run.conclusion === 'skipped') return [];
   const seen: FactoryState = { ...st, runs: [...st.runs, run.url] };
   if (expected === 'verify') return verified(issue, seen, snap, run, ctx);
   if (run.conclusion !== 'success') return fail(issue, seen, `the ${expected} run ended with "${run.conclusion}"`, ctx);
@@ -310,7 +315,12 @@ function reviewed(issue: number, st: FactoryState, snap: IssueSnapshot, ctx: Ctx
 
 function fixed(issue: number, st: FactoryState, snap: IssueSnapshot, ctx: Ctx): Action[] {
   // Without the head the fixer started from, nothing shows that it pushed.
-  if (!snap.pr || st.headSha === undefined || snap.pr.headSha === st.headSha) return fail(issue, st, 'the fixer finished without pushing a commit', ctx);
+  if (!snap.pr || st.headSha === undefined) return fail(issue, st, 'the fixer finished without pushing a commit', ctx);
+  if (snap.pr.headSha === st.headSha) {
+    // The branch already moved but the PR has not caught up: look again on the next sweep rather than burn an attempt.
+    if (snap.pr.branchSha && snap.pr.branchSha !== st.headSha) return [];
+    return fail(issue, st, 'the fixer finished without pushing a commit', ctx);
+  }
   return onward(issue, st, snap, 'verify', ctx);
 }
 
@@ -521,6 +531,12 @@ function sweepOne(snap: IssueSnapshot, ctx: Ctx): Action[] {
   // The event can be dropped by the router's concurrency group; the review itself stays on the PR.
   const cr = snap.lastChangesRequested;
   if (st.stage === 'ready' && cr && ctx.can('queue', cr.actor) && notBefore(cr.at, st.since)) return toFix(snap.number, st, snap, 'maintainer', ctx);
+  // Marking the PR ready comes after the state is saved; if it failed, nothing else would ever try again. It is safe
+  // to repeat: a PR that is no longer a draft is left as it is.
+  // Only for a while: after that a draft is more likely someone's choice than a failure.
+  if (st.stage === 'ready' && snap.pr?.open && snap.pr.draft && snap.pr.number === st.pr && ctx.now.getTime() - Date.parse(st.since) <= STUCK_AFTER_MS) {
+    return [{ kind: 'pr-ready', issue: snap.number, pr: snap.pr.number, reviewer: st.queuedBy ?? ctx.fallbackReviewer }];
+  }
   if (!ACTIVE_STAGES.includes(st.stage)) return [];
   if (st.failedAt) {
     const due = ctx.now.getTime() - Date.parse(st.failedAt) >= RETRY_AFTER_MS;
@@ -540,6 +556,11 @@ function sweepOne(snap: IssueSnapshot, ctx: Ctx): Action[] {
   if (snap.lastRun) {
     const acted = runFinished(snap.number, st, snap, snap.lastRun, ctx);
     if (acted.length > 0) return acted;
+  }
+  // The dispatch comes after the state is saved too. No run for the attempt after this long means it never started.
+  const idle = ctx.now.getTime() - Date.parse(st.since);
+  if (!snap.lastRun && st.attempt && RUNNER_FOR[st.stage] && idle > DISPATCH_RETRY_AFTER_MS && idle <= STUCK_AFTER_MS) {
+    return [{ kind: 'dispatch', issue: snap.number, workflow: RUNNER_FOR[st.stage] as RunWorkflow, attempt: st.attempt }];
   }
   if (ctx.now.getTime() - Date.parse(st.since) > STUCK_AFTER_MS) {
     return block(snap.number, st, `no progress for ${STUCK_AFTER_MS / 60000} minutes.`, 'stuck', ctx);

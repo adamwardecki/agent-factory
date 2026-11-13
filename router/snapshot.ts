@@ -3,9 +3,10 @@
 // needs, and only if nobody without it edited them since.
 
 import { type Authority, COMMAND_ROLES, holdsAny, type Role } from './authority.ts';
-import { ROUTER_LOGIN, RUNNER_FOR, STAGES, STATE_VERSION, stageLabel } from './config.ts';
+import { branchFor, ROUTER_LOGIN, RUNNER_FOR, STAGES, STATE_VERSION, stageLabel } from './config.ts';
 import type { IssueSnapshot, RunSnapshot } from './decide.ts';
 import {
+  branchHead,
   type Comment,
   commentEditors,
   type Edit,
@@ -119,6 +120,8 @@ export async function load(gh: Gh, issue: number, trust: Trust, now: Date): Prom
   const prNumber = state?.pr ?? (await findPull(gh, issue));
   const raw = prNumber ? await pullSnapshot(gh, prNumber) : null;
   const signed = raw ? verify(trust.key, issue, 'pr', raw.body) : false;
+  // The PR's head can trail the branch by a moment after a push; decide.ts waits for it rather than fail a fix.
+  const branchSha = raw ? await branchHead(gh, branchFor(issue)) : null;
   const reviews = raw ? await listReviews(gh, raw.number) : [];
   const prComments = raw ? await listComments(gh, raw.number) : [];
   const all = [...comments, ...prComments];
@@ -136,7 +139,7 @@ export async function load(gh: Gh, issue: number, trust: Trust, now: Date): Prom
       queuedBy,
       brief: briefFrom(comments, issue, trust.key),
       pr: raw
-        ? { number: raw.number, headSha: raw.headSha, open: raw.open, base: raw.base, draft: raw.draft, conflicting: raw.conflicting, files: raw.files, signed, attempt: signed ? attemptOf(raw.body) : null }
+        ? { number: raw.number, headSha: raw.headSha, branchSha: branchSha ?? undefined, open: raw.open, base: raw.base, draft: raw.draft, conflicting: raw.conflicting, files: raw.files, signed, attempt: signed ? attemptOf(raw.body) : null }
         : null,
       review: reviewFrom(reviews, issue, trust.key),
       lastCommand: await commandFrom(all, edits, trust.authority),
