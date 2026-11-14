@@ -166,7 +166,8 @@ Three files. None of them contains factory logic.
   code runs. They have one source: the caller.
 - **Matt Pocock's repo conventions are optional.** The stage skills carry defaults when the repo has no
   `docs/agents/`. The CLI offers to add `.claude/settings.json` with the skills pin for local sessions, and never
-  overwrites an existing one; it prints the lines to merge instead.
+  overwrites an existing one; it prints the lines to merge instead. (Phase 5: the pin format for local sessions
+  isn't settled yet.)
 
 ## Router
 
@@ -478,7 +479,12 @@ The mode is an install-time choice. Switching modes re-renders the stage caller;
   commands and `doctor` checks the secret exists.
 - The job's permissions don't include `id-token`.
 - The token needs renewing by hand. When a stage dies before its first model call with an auth error, the router
-  comments once on the issue, saying to renew the token.
+  blocks the issue (`credential`) and comments once, saying to renew the token; `/retry` afterwards. The signal
+  is a step of the agent job, `Claude refused the credential`, which fails only when the action's result is an
+  error at no cost with the API's authentication message (a dummy token in the sandbox gave "Failed to
+  authenticate. API Error: 401 OAuth access token is invalid."). The router reads that step's conclusion from the
+  jobs API, which a dispatched report can't fake. The agent's own test code could write that output file and fake
+  it; the worst it buys is a block instead of a retry.
 
 **`oidc`: workload identity federation.**
 - **Inputs:** `organization_id`, `federation_rule_id`, `service_account_id` and `workspace_id`. These are IDs, not
@@ -510,17 +516,21 @@ The mode is an install-time choice. Switching modes re-renders the stage caller;
 
 `node cli/factory.ts <command> --repo <owner>/<name>`, run from a clone of `agent-factory` at a release tag. It
 needs Node 22.18+ and an authenticated `gh` with the `workflow` scope. It holds no state: every command reads the
-repo and acts on what it finds, so running it twice is safe.
+repo and acts on what it finds, so running it twice is safe: the second run writes nothing.
 
 - **`init`** installs the contract:
   1. Runs the `doctor` checks that can fail before anything exists, and stops on an error.
   2. Creates the labels that are missing. Sets `FACTORY_DRY_RUN` to `1` if it's unset. Generates
      `FACTORY_SIGNING_KEY` if the secret is missing. Turns on "Actions may create pull requests".
-  3. Opens a pull request with the two caller workflows and, if the repo has none, a first `factory.json` from
-     the flags (`--preset`, `--queue`, `--auth`). A pull request, not a push to the default branch, so the
-     installer needs no bypass of branch rules and the maintainer reviews what will run.
+  3. Opens a pull request from `factory/install` with the two caller workflows, the `.factory/` line in
+     `.gitignore` and, if the repo has none, a first `factory.json` from the flags (`--queue`, `--test`,
+     `--install`, `--lint`, `--typecheck`, `--node`, `--python`; `--preset` arrives with presets in phase 5). The
+     flags are checked with the router's own config parser before init writes anything. A pull request, not a push
+     to the default branch, so the installer needs no bypass of branch rules and the maintainer reviews what will
+     run.
   4. Prints what's left: the Claude credential, and going live with `gh variable set FACTORY_DRY_RUN --body 0`.
-  - `--protect-default-branch` also adds a ruleset requiring one approving review, if no rule requires one yet.
+  - `--protect-default-branch` (phase 5) also adds a ruleset requiring one approving review, if no rule requires
+    one yet. Not in phase 2: rulesets return 403 on a private repo on the Free plan, so the sandbox can't check it.
 - **`doctor`** checks a repo and prints errors and warnings. It reads workflow files as text, because there's no
   YAML parser; its warnings are hints, not proofs.
 
@@ -528,9 +538,10 @@ repo and acts on what it finds, so running it twice is safe.
   |---|---|
   | The `gh` token's scopes and admin access | error |
   | Actions is enabled, and the allowed-actions policy admits the factory repo and `anthropics/claude-code-action` | error |
-  | "Actions may create pull requests" is on, and the organisation hasn't locked it off | error |
+  | "Actions may create pull requests" is on, and the organisation hasn't locked it off. Reading the organisation's setting needs `admin:org`, so with the usual scopes this is an info line; `init` changes the setting before anything else, and stops on GitHub's 409 if the organisation forbids it | error |
   | `factory.json` validates; the callers' pinned SHA exists in the factory repo; the interface version is known | error |
-  | A rule that covers `factory/issue-*` requires signed commits or restricts creating branches | error |
+  | A ruleset that covers `factory/issue-*` requires signed commits, a pull request, status checks, deployments or a merge queue, restricts creating or updating branches, or blocks force pushes (a rebase round force-pushes). Classic branch protection with a wildcard pattern isn't read; the runbook says to check it by hand | error |
+  | A factory label exists only in another case (GitHub refuses the exact one next to it, and the router matches exactly) | error |
   | `oauth_token` mode with a permission level in `roles` | error |
   | The signing key and the Claude credential exist (names only; values can't be read) | error |
   | The default branch has required checks: they run on a factory PR only after someone approves the workflow runs | info |
@@ -538,7 +549,9 @@ repo and acts on what it finds, so running it twice is safe.
   | A CLA or DCO check is required | warning |
   | `FACTORY_DRY_RUN` and `FACTORY_PAUSED` values; issues in flight | info |
 - **`upgrade <sha>`** opens a pull request that re-renders the callers at a new pin. It refuses a release whose
-  interface or state version the repo can't move to in one step, and names the release to go through.
+  interface or state version the repo can't move to in one step, and names the version to go through. Moving to a
+  new state version also waits until no issue in flight still holds a state older than the pinned release's.
+  `init` never moves a pin: it leaves installed callers as they are and says to run `upgrade`.
 - **`rotate-key`** replaces the signing key (see Trust).
 - **`pause`** and **`resume`** set `FACTORY_PAUSED`. `gh variable set FACTORY_PAUSED --body 1` does the same.
 
@@ -608,7 +621,8 @@ already exist. So the old factory goes first:
 - **A marker signed with a retired key:** the router blocks the issue with the reason `key-rotated`.
 - **An unknown interface or state version:** the workflow fails, or the router leaves the issue alone, with a
   message naming the release that supports it.
-- **The Claude credential is refused:** the router comments once, saying to renew or check it.
+- **The Claude credential is refused:** the router blocks the issue (`credential`) and comments once, saying to
+  renew the token; `/retry` once it's renewed.
 
 ## Testing
 

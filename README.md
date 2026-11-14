@@ -31,55 +31,40 @@ factory. It runs on the PR once a maintainer approves the workflow runs.
 A change to a risky path (workflows, agent instructions, dependency manifests, and the repo's own list) waits for
 `/approve` before anything runs on the branch.
 
-## Trying it on a sandbox repo
+## Installing
 
-The stage workflows check this repo out with the *target* repo's `GITHUB_TOKEN`, which can't read another private
-repo. So this repo has to be public before a target repo can run it (or the workflows need a read token). Phase 1
-works either way.
+You need admin access to the repo, a logged-in `gh` with the `repo` and `workflow` scopes, and Node 22.18 or newer.
+Run the CLI from a clone of this repo at the commit you want to pin; it pins the clone's `HEAD`, which has to be on
+GitHub.
 
-Use a throwaway repo. You need admin access to it, the `gh` CLI, and Node 22.18 or newer.
+```bash
+git clone https://github.com/adamwardecki/agent-factory && cd agent-factory
+node --no-warnings cli/factory.ts doctor --repo <owner/name>
+node --no-warnings cli/factory.ts init --repo <owner/name> --queue <your-login> --node 24.x --install 'npm ci' --test 'npm test'
+```
 
-1. Add `.factory/` to the repo's `.gitignore`.
-2. Write `.github/factory.json` on the default branch:
+`init` creates the labels, sets `FACTORY_DRY_RUN` to `1`, generates `FACTORY_SIGNING_KEY` and turns on "Allow
+GitHub Actions to create and approve pull requests", each only if it's missing. Then it opens one pull request with
+the two caller workflows, a first `.github/factory.json` (if the repo has none; the flags above fill it in) and the
+`.factory/` line in `.gitignore`. Running it again writes nothing, and it never moves the pin of callers that are
+already installed: that's `upgrade`. What's left is printed:
 
-   ```json
-   {
-     "version": 1,
-     "roles": { "queue": ["your-github-login"] },
-     "toolchain": { "node": "24.x" },
-     "commands": { "install": "npm ci", "test": "npm test" }
-   }
-   ```
+1. Merge the pull request.
+2. Set the Claude credential: `claude setup-token`, then `gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo <owner/name>`.
+3. Label an issue `agent:queued`. The `factory-router` run logs what it would do and writes nothing.
+4. Go live: `gh variable set FACTORY_DRY_RUN --body 0 --repo <owner/name>`.
 
-3. Render the two caller workflows at a commit of this repo, and commit them to the default branch:
+The other commands:
 
-   ```bash
-   node --no-warnings scripts/render-callers.ts <owner>/agent-factory <40-character commit SHA> '*/30 * * * *' <target repo>/.github/workflows
-   ```
+| Command | Does |
+|---|---|
+| `doctor` | Checks the repo against the install contract: access, the Actions policy and settings, branch rules, the config, the callers' pin, labels and secrets. Exits 1 on an error. |
+| `upgrade <sha>` | Opens a pull request that moves the callers to another commit of this repo. Refuses one more than one interface or state version away. |
+| `pause`, `resume` | Set and remove `FACTORY_PAUSED`. Paused, the router does nothing, and a publish job that is already running makes no further write. |
+| `rotate-key` | Replaces `FACTORY_SIGNING_KEY`. Refuses while issues are in flight; `--now`, after a leak, blocks them with `key-rotated`. |
 
-4. Set the secrets and the dry-run switch:
-
-   ```bash
-   openssl rand -hex 32 | gh secret set FACTORY_SIGNING_KEY -R <target repo>
-   claude setup-token   # then: gh secret set CLAUDE_CODE_OAUTH_TOKEN -R <target repo>
-   gh variable set FACTORY_DRY_RUN --body 1 -R <target repo>
-   ```
-
-5. Allow Actions to create pull requests: Settings → Actions → General → Workflow permissions.
-6. Create the labels:
-
-   ```bash
-   for s in queued waiting planning awaiting-approval building ci in-review fixing ready blocked; do
-     gh label create "agent:$s" --color 5319e7 --force -R <target repo>
-   done
-   for l in needs-info ready-for-agent ready-for-human; do gh label create "$l" --force -R <target repo>; done
-   ```
-
-7. Label an issue `agent:queued`. The `factory-router` run logs what it would do and writes nothing.
-8. Go live: `gh variable set FACTORY_DRY_RUN --body 0 -R <target repo>`.
-
-To stop the factory at any time: `gh variable set FACTORY_PAUSED --body 1 -R <target repo>`. The router then does
-nothing, and a publish job that is already running makes no further write.
+When the subscription token expires, the next stage stops before Claude's first model call: the factory blocks the
+issue and comments how to renew the token. `/retry` once it's renewed.
 
 ## Commands
 
@@ -93,7 +78,7 @@ people unless you list others) may `/approve` and `/stop`.
 ## Working on this repo
 
 ```bash
-npm install
+npm ci
 npm run typecheck && npm run lint && npm test
 ```
 
