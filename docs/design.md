@@ -753,6 +753,11 @@ Run 2026-11-14, with the four fixes above pinned. No new bugs in the factory's c
   push to a PR or its base, GitHub reports `mergeable_state: unknown` while it works the answer out, so the router run
   that the merge woke read the PR as clean. The PR read now asks again, up to five times two seconds apart, while
   the state is `unknown`.
+- **Both fixes checked on GitHub:** a third build's probe saw neither token with a value, in its own environment or
+  any visible process; and merging one ready PR sent the other, which it made conflicting, to a rebase in the same
+  router run. On the way, a plain YAML value holding `': '` made GitHub refuse `stage.yml` at dispatch; the sweep
+  dispatched the lost plan again, same attempt, ten minutes later. CI now runs actionlint, and a test refuses the
+  pattern.
 - **Not a bug:** an issue carries two stage labels for under a second while it changes stage (the new label is
   added, then the old one removed, so it is never without one; the router finds issues by those labels).
 
