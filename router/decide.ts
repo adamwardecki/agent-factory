@@ -40,7 +40,8 @@ export type RunSnapshot = {
   attempt: string | null; // from the run's title
   // For an agent stage: 'success' only if prepare, agent and publish all succeeded. For verify: 'success' or 'failure'
   // is the result of the checks; anything else means the run broke before it could tell. 'credential': the agent
-  // job's credential step says Claude refused the credential.
+  // job's credential step says Claude refused the credential. 'usage-limit': its next step says the subscription's
+  // usage window had run out.
   conclusion: string | null;
   url: string;
   completedAt: string | null; // null while the run is still going
@@ -267,6 +268,10 @@ function runFinished(issue: number, st: FactoryState, snap: IssueSnapshot, run: 
   if (expected === 'verify') return verified(issue, seen, snap, run, ctx);
   // Retrying can't help until someone renews the credential, so the issue stops now and says how, once.
   if (run.conclusion === 'credential') return block(issue, seen, CREDENTIAL_REFUSED, 'credential', ctx);
+  // The subscription's window ran out before Claude did anything. That isn't the stage failing: the sweep tries
+  // again after the usual delay, and no attempt is spent (sandbox trial: two runs in one 5-hour window would
+  // otherwise have blocked the issue).
+  if (run.conclusion === 'usage-limit') return [{ kind: 'save', issue, state: { ...seen, failedAt: ctx.now.toISOString() } }];
   if (run.conclusion !== 'success') return fail(issue, seen, `the ${expected} run ended with "${run.conclusion}"`, ctx);
   switch (expected) {
     case 'plan':

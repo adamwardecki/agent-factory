@@ -8,24 +8,27 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 const stage = readFileSync(new URL('../.github/workflows/stage.yml', import.meta.url), 'utf8');
-const program = /if jq -e '(.+)' "\$f" >\/dev\/null; then/.exec(stage)?.[1];
+const programs = [...stage.matchAll(/if jq -e '(.+)' "\$f" >\/dev\/null; then/g)].map((m) => m[1] ?? '');
+const [program, limitProgram] = programs;
 const hasJq = spawnSync('jq', ['--version']).status === 0;
 
-function refused(output: unknown): boolean {
+function matches(jqProgram: string | undefined, output: unknown): boolean {
   const dir = mkdtempSync(join(tmpdir(), 'factory-credential-'));
   const f = join(dir, 'out.json');
   writeFileSync(f, typeof output === 'string' ? output : JSON.stringify(output));
   try {
-    execFileSync('jq', ['-e', program ?? '', f], { stdio: 'ignore' });
+    execFileSync('jq', ['-e', jqProgram ?? '', f], { stdio: 'ignore' });
     return true;
   } catch {
     return false;
   }
 }
+const refused = (output: unknown) => matches(program, output);
+const limited = (output: unknown) => matches(limitProgram, output);
 const result = (extra: Record<string, unknown>) => [{ type: 'system', subtype: 'init' }, { type: 'result', subtype: 'success', num_turns: 1, total_cost_usd: 0, ...extra }];
 
-test('the credential step finds its jq program in stage.yml', () => {
-  assert.ok(program, 'the step\'s `if jq -e \'...\' "$f"` line');
+test('the credential and usage-limit steps find their jq programs in stage.yml', () => {
+  assert.equal(programs.length, 2, 'two `if jq -e \'...\' "$f"` lines: the credential step, then the usage-limit step');
 });
 
 test('the credential step fires on a refused credential and on nothing else', { skip: !hasJq && 'jq is not installed' }, () => {
@@ -37,4 +40,15 @@ test('the credential step fires on a refused credential and on nothing else', { 
   assert.equal(refused(result({ is_error: false, result: 'Failed to authenticate.' })), false);
   assert.equal(refused({ not: 'an array' }), false);
   assert.equal(refused('not json'), false);
+});
+
+test('the usage-limit step fires on a subscription limit and on nothing else', { skip: !hasJq && 'jq is not installed' }, () => {
+  // Seen in the sandbox trial, for both models, when the subscription's window ran out.
+  assert.equal(limited(result({ is_error: true, result: "You've hit your 5-hour limit · resets 4:40pm (UTC)" })), true);
+  assert.equal(limited(result({ is_error: true, result: 'Claude AI usage limit reached|1763139600' })), true);
+  assert.equal(limited(result({ is_error: true, result: 'Failed to authenticate. API Error: 401 OAuth access token is invalid.' })), false);
+  assert.equal(limited(result({ is_error: true, total_cost_usd: 0.3, result: "You've hit your 5-hour limit" })), false, 'it got as far as a model call');
+  assert.equal(limited(result({ is_error: false, result: 'limit' })), false);
+  // And the credential step leaves a limit alone.
+  assert.equal(refused(result({ is_error: true, result: "You've hit your 5-hour limit · resets 4:40pm (UTC)" })), false);
 });

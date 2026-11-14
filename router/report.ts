@@ -4,7 +4,7 @@
 // the run it names is this repo's stage run for that stage, issue and attempt. A forged "success" still can't move
 // an issue on: decide.ts then checks the stage's real output (a signed brief, PR or review).
 
-import { CREDENTIAL_STEP, parseRunTitle, type RunWorkflow } from './config.ts';
+import { CREDENTIAL_STEP, LIMIT_STEP, parseRunTitle, type RunWorkflow } from './config.ts';
 import type { RunSnapshot } from './decide.ts';
 import type { Report } from './events.ts';
 import type { Job } from './github.ts';
@@ -19,7 +19,9 @@ const job = (jobs: readonly Job[], name: string) => jobs.find((j) => j.name === 
 export function conclude(workflow: RunWorkflow, jobs: readonly Job[], reported?: 'success' | 'failure'): string {
   if (jobs.some((j) => j.conclusion === 'cancelled')) return 'cancelled';
   // The agent job's credential step fails only when Claude refused the credential before its first model call.
-  if (workflow !== 'verify' && job(jobs, 'agent')?.steps?.some((s) => s.name === CREDENTIAL_STEP && s.conclusion === 'failure')) return 'credential';
+  const failedStep = (name: string) => workflow !== 'verify' && job(jobs, 'agent')?.steps?.some((s) => s.name === name && s.conclusion === 'failure');
+  if (failedStep(CREDENTIAL_STEP)) return 'credential';
+  if (failedStep(LIMIT_STEP)) return 'usage-limit';
   const ok = (name: string) => job(jobs, name)?.conclusion === 'success';
   if (workflow === 'verify') {
     if (!ok('prepare')) return 'startup_failure';

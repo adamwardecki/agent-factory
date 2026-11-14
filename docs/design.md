@@ -623,6 +623,10 @@ already exist. So the old factory goes first:
   message naming the release that supports it.
 - **The Claude credential is refused:** the router blocks the issue (`credential`) and comments once, saying to
   renew the token; `/retry` once it's renewed.
+- **The subscription's usage limit is reached** before the first model call (Claude answers "You've hit your
+  5-hour limit · resets …"): a second step of the agent job, `Claude hit the usage limit`, fails, and the router
+  saves the retry time without spending an attempt. The sweep tries again after the retry delay. Found in the
+  sandbox trial, where the factory shared one subscription with the maintainer's own sessions.
 
 ## Testing
 

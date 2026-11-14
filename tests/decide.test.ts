@@ -179,6 +179,17 @@ test('a refused credential blocks the issue at once and says to renew the token'
   assert.deepEqual(stages(again), ['building']);
 });
 
+test('a usage limit waits for the retry without spending an attempt, even on the last one', () => {
+  for (const [stage, workflow] of [['planning', 'plan'], ['building', 'build'], ['fixing', 'fix']] as const) {
+    const a = finished(snap(st(stage, { pr: 51, headSha: 'sha-0', attempts: 1 }), { pr: pr() }), run(workflow, 'usage-limit'));
+    assert.deepEqual(stages(a), [stage], stage);
+    assert.equal(saves(a)[0]?.attempts, 1, 'no attempt spent');
+    assert.equal(saves(a)[0]?.failedAt, NOW.toISOString(), 'retried after the usual delay');
+    assert.equal(saves(a)[0]?.runs.length, 1, 'the run is recorded, so it is not judged again');
+    assert.deepEqual(comments(a), []);
+  }
+});
+
 test('a build that opened a signed PR goes to verify on its head', () => {
   const a = finished(snap(st('building'), { pr: pr() }), run('build'));
   assert.deepEqual(stages(a), ['ci']);

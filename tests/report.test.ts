@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { CREDENTIAL_STEP } from '../router/config.ts';
+import { CREDENTIAL_STEP, LIMIT_STEP } from '../router/config.ts';
 import { checkReport, conclude, runSnapshot } from '../router/report.ts';
 
 const run = {
@@ -111,4 +111,15 @@ test('an agent job whose credential step failed reads as a refused credential, a
   assert.equal(conclude('build', agent([{ name: CREDENTIAL_STEP, conclusion: 'skipped' }])), 'failure');
   assert.equal(conclude('build', agent([{ name: 'Run tests', conclusion: 'failure' }])), 'failure');
   assert.equal(conclude('build', agent([])), 'failure');
+});
+
+test('an agent job whose usage-limit step failed reads as a usage limit, not as a failed attempt', () => {
+  const agent = (steps: { name: string; conclusion: string | null }[]) => [
+    { name: 'stage / prepare', conclusion: 'success', status: 'completed' },
+    { name: 'stage / agent', conclusion: 'failure', status: 'completed', steps },
+    { name: 'stage / publish', conclusion: 'success', status: 'completed' },
+  ];
+  assert.equal(conclude('plan', agent([{ name: LIMIT_STEP, conclusion: 'failure' }])), 'usage-limit');
+  assert.equal(conclude('plan', agent([{ name: LIMIT_STEP, conclusion: 'success' }])), 'failure');
+  assert.equal(conclude('plan', agent([{ name: CREDENTIAL_STEP, conclusion: 'failure' }, { name: LIMIT_STEP, conclusion: 'skipped' }])), 'credential');
 });

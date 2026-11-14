@@ -45,6 +45,8 @@ export function parseRunTitle(title: string): { workflow: RunWorkflow; issue: nu
 // The agent job's step that fails when Claude refused the credential before its first model call. The router reads
 // its conclusion from the jobs API, which a dispatched report can't fake.
 export const CREDENTIAL_STEP = 'Claude refused the credential';
+// The step after it, which fails only when the subscription's usage window had run out before the first model call.
+export const LIMIT_STEP = 'Claude hit the usage limit';
 
 export const LABEL_PREFIX = 'agent:';
 export const stageLabel = (s: Stage) => `${LABEL_PREFIX}${s}`;

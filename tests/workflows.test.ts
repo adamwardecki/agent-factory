@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import { test } from 'node:test';
-import { CALLER_INTERFACE, CREDENTIAL_STEP } from '../router/config.ts';
+import { CALLER_INTERFACE, CREDENTIAL_STEP, LIMIT_STEP } from '../router/config.ts';
 import { parseRepoConfig } from '../router/repo-config.ts';
 import { allowedTools } from '../router/tools.ts';
 import { CALLERS, callerVars, render } from '../scripts/render-callers.ts';
@@ -343,4 +343,15 @@ test('the reusable workflows and the templates speak the interface the CLI reads
     const lines = [...read(f).matchAll(/^\s+interface: (\d+)$/gm)].map((m) => Number(m[1]));
     assert.ok(lines.length > 0 && lines.every((n) => n === CALLER_INTERFACE), f);
   }
+});
+
+test('the agent job says when Claude hit the subscription\'s usage limit, right after the credential step', () => {
+  const stage = read('.github/workflows/stage.yml');
+  const at = stage.indexOf(`- name: ${LIMIT_STEP}\n`);
+  assert.ok(at > stage.indexOf(`- name: ${CREDENTIAL_STEP}\n`), 'after the credential step');
+  const step = stage.slice(at, stage.indexOf('\n      - ', at + 1));
+  assert.match(step, /if: \$\{\{ !cancelled\(\) && steps\.claude\.outcome == 'failure' \}\}/);
+  assert.match(step, /EXECUTION_FILE: '\$\{\{ steps\.claude\.outputs\.execution_file \}\}'/);
+  assert.match(step, /hit your .*limit/);
+  assert.match(step, /exit 1/);
 });
