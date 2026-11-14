@@ -89,7 +89,10 @@ machine and is pure. `router/publish.ts` is the only code that writes a stage's 
 
 See "Limitations" in `docs/design.md`. The ones to know before a first trial:
 
-- The repo's own required checks run on a factory PR only after a maintainer approves the workflow runs.
+- The repo's own required checks run on a factory PR only after a maintainer approves the workflow runs. Once
+  approved, they count for the branch's rules.
+- A test that starts Chrome needs `--no-sandbox` when `CI` is set: Chrome's own sandbox can't start inside the
+  factory's.
 - Agents can't add a dependency: the factory installs from the default branch's lockfile.
 - This release supports the subscription token only, logins (not permission levels) in `roles`, and one issue at a
   time.

@@ -594,14 +594,19 @@ It manages settings, and files only on request. It holds no secret, so any backe
 The new caller files have the same names as two of the old workflows, and the labels and `FACTORY_DRY_RUN`
 already exist. So the old factory goes first:
 
-1. Finish or block every issue the old factory has in flight.
+Done 2026-11-14; see "Adoption: job-tracker-mcp" for what differed.
+
+1. Finish or block every issue the old factory has in flight, and disable the old factory's workflows.
 2. Remove the old factory in one maintainer PR: `factory/`, the six `factory-*.yml` workflows, the
    `.claude/skills/factory-*` skills, the factory rows in AGENTS.md and `tests/factory/`. Keep `docs/factory.md` as a
-   pointer to the new runbook. Keep `.claude/settings.json`.
+   pointer to the new runbook. Keep `.claude/settings.json`. Add the repo's `factory.json` in the same PR, so `init`
+   finds it.
 3. Run `init`. It keeps the existing labels, leaves `FACTORY_DRY_RUN` as it is (check that it holds `1`), sets the
    signing key and opens the install PR. Edit `factory.json` in that PR: `riskyPaths` copied from the old
    `factory/risky-paths.txt`, and `prSkill` set to `.claude/skills/create-pr`. Run `doctor` and fix what it
    reports.
+   After the install PR merges, run `gh workflow disable` then `gh workflow enable` on both callers: a workflow
+   disabled at a path stays half-disabled when a new file arrives at that path (listed as active, but no run starts).
 4. Set `FACTORY_DRY_RUN` to `0`. Run a docs issue through to a merged PR.
 5. Uninstall the `job-tracker-factory` App and delete its key, and delete the secrets the old factory used:
    `FACTORY_APP_PRIVATE_KEY`, `FACTORY_APP_ID` and the App variables. Remove the two rulesets that contained the App
@@ -708,7 +713,7 @@ The probe workflows and their runs stay in that repo.
 | 6 | **Pass** | A workflow with `pull-requests: write` opened a draft PR with `GITHUB_TOKEN`; the PR's author is `github-actions[bot]`. Needs "Actions may create PRs" on (repo setting, off by default). No design change. |
 | 7 | **Pass, with a condition** | The same run that opened a PR could mark it ready and request a review. Across runs, as the design has it (publish opens the draft, a later router run readies it): a run with `contents: write` marked the PR ready (PR #4), and a run with `contents: read` was refused with `Resource not accessible by integration` (PR #3 stayed a draft); the review request worked in both. **The cause is `contents: write`, not who opened the PR:** the old in-repo factory's router had `contents: read` and blamed the App. So the router job and its caller get `contents: write` (see Router, Permissions). No other design change. |
 | 2 (approval) | **Pass** | `opened` and `synchronize` on a PR that `GITHUB_TOKEN` opened and pushed to each created a `pull_request` run with conclusion `action_required`, one per head. Approving the latest one with `POST /actions/runs/{id}/approve` as the repo owner ran the workflow and its check appeared on the PR. So the repo's own CI waits for a maintainer, per head, as designed. The runs appeared 30 to 60 seconds after the push, not at once. |
-| 2 (required checks) | **Not tested** | Needs a ruleset or branch protection. The Free plan returns 403 on both for private repos ("Upgrade to GitHub Pro or make this repository public"). Whether an approved run satisfies a *required* check is still open. A public sandbox would answer it. Low risk: after approval, the `test` check run appeared in the PR's status rollup on the head commit, which is what a required-status rule matches; it runs for real in phase 3, on `job-tracker-mcp`'s rulesets. |
+| 2 (required checks) | **Pass** (phase 3, on `job-tracker-mcp`) | The Free plan returns 403 on rulesets for private repos, so the sandbox couldn't test this; `job-tracker-mcp` is public, and its `main` ruleset requires four `test (…)` checks. On the factory's first PR there, the CI run waited as `action_required`. After the maintainer approved it, the four checks passed and counted for the rule: the merge box was blocked only on the required review. CodeQL ran without an approval. |
 | 1 | **Fails as expected** | `wr-target` dispatched by a user fired the `workflow_run` listener; `wr-target` dispatched by `GITHUB_TOKEN` ran but fired no listener, several minutes later. A `workflow_dispatch` from `GITHUB_TOKEN` itself works. So the report dispatch and the sweep carry the factory, as designed. Drop the `workflow_run` trigger from the router caller: it only fires for runs a person dispatched. |
 | 3 | **Pass after one fix** | `scripts/sandboxed.sh` ran a real `npm ci && npm test` on a hosted runner (registry reachable), and hid the job: empty `RUNNER_TEMP`, no runner install directory, no git credentials in the checkout, `/etc` and `/usr` read-only, only 4 processes visible. **It leaked the whole step environment, token included, through `/proc/1/environ`:** pid 1 inside the new PID namespace is bwrap itself, and `--clearenv` only cleans the command it runs. Fixed by starting bwrap as `env -i PATH="$PATH" bwrap …`; after it, pid 1's environment is `PATH` only and no process's environment holds the planted secret. Also learned: `ubuntu-latest` is Ubuntu 26.04 and ships bubblewrap 0.11.1 but not socat; `apt-get update` hung for 3m20s on mirror DNS failures in two runs. So: install packages only when missing, never run `apt-get update` first, and give the step a timeout. Confirmed: socat installed from the image's own package lists without an update in about 28 seconds (the Azure mirror failed and `archive.ubuntu.com` served it). |
 | 4 | **Pass** | With a dummy `CLAUDE_CODE_OAUTH_TOKEN`, `claude-code-action` ran its whole setup with `github_token` set to a read-only `GITHUB_TOKEN` (`contents`, `issues`, `pull-requests`, `actions` all read) and `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`; nothing asked for a write permission. Then, on 2026-11-13, with a real token from `claude setup-token`: under the scrub and the read-only token, the agent ran `Bash(git log:*)`, wrote `.factory/out/git.txt` and `.factory/out/ok.txt` through `Edit(./.factory/**)`, and was refused a write to `./notes.txt` in the repo root (absent afterwards, `git status` clean). Cost $0.05 with Sonnet. No design change. |
@@ -823,8 +828,47 @@ labels, signing key, dry-run variable or PR setting; only the Claude token kept.
   - The PR only adds code; the one removed line is the test import, which gained `square`.
   - No comment repeats the planted text.
 
+## Adoption: job-tracker-mcp (phase 3)
+
+Run 2026-11-14 on `adamwardecki/job-tracker-mcp` (public).
+
+**Before adopting:**
+- **Old factory:** its six workflows were disabled. Its `FACTORY_DRY_RUN` held `)`, which the old factory read as
+  live; the new one reads anything but `0` as dry run.
+- **A probe in the sandbox:** it ran the repo's commands through `scripts/sandboxed.sh`. Install and lint passed;
+  `npm test` failed on the three Chrome guard tests. Chrome's own sandbox can't start inside bubblewrap ("The SUID
+  sandbox helper binary was found, but is not configured correctly").
+- **The fix, in the repo:** the test now passes `--no-sandbox` when `CI` is set, and both factory sandboxes set it.
+
+**The move:** two maintainer PRs, then `init`.
+- **The PRs:** the Chrome fix; then the removal (31 files, Node tests 784 to 586), which also added `factory.json`
+  with 15 repo risky paths on top of the baseline.
+- **`init`:** turned the PR setting on, created `agent:waiting`, generated the signing key and opened an install PR
+  with the two callers. A second `init` wrote nothing.
+
+**What went wrong:**
+- **Half-disabled callers:** the new `factory-router.yml` and `factory-stage.yml` took the IDs of the old workflows
+  disabled at those paths. GitHub listed them as active, but a label started no run, and a dispatched run stayed
+  `queued` with no jobs. That run can be neither cancelled (409) nor deleted (403).
+- **The fix:** `gh workflow disable` then `enable` on both callers; the next label started the router. The
+  migration steps above now include it.
+
+**The first issue:**
+- **The run:** a docs change ("a table of contents for `docs/hermes.md`") went plan, build, verify, review, ready
+  in about 8 minutes, with no failed attempt. Verify passed in the sandbox, Chrome tests included.
+- **The PR:** by `github-actions[bot]`, marked ready, review requested from the maintainer. It also added a test
+  that keeps the table of contents in sync, which wasn't asked for and was accepted in review.
+- **Required checks:** see check 2's row above.
+- **The merge:** after the maintainer's approval and squash merge, the issue closed and the router saved `done`.
+
+**After:** the old App was uninstalled and deleted, and its secret and three variables removed. Left: the Claude
+token, the signing key and `FACTORY_DRY_RUN=0`.
+
 ## Limitations
 
+- **Chrome in tests needs `--no-sandbox`:** Chrome's own sandbox can't start inside bubblewrap, which both
+  the verify sandbox and the agent job's env scrub use. A test that starts Chrome has to pass `--no-sandbox` when
+  `CI` is set (both set it), as `job-tracker-mcp`'s guard test does.
 - **One manual step per repo:** in `oauth_token` mode, `claude setup-token` and `gh secret set`, and the token
   needs renewing by hand. In `oidc` mode, a federation rule in the Claude Console instead, and nothing to renew.
 - **Shared limits (`oauth_token` mode):** every adopting repo, every parallel issue, and the maintainer's local
