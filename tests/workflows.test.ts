@@ -329,7 +329,8 @@ test('the agent job says when Claude refused the credential, in a step the route
   // (sandbox trial: "Failed to authenticate. API Error: 401 OAuth access token is invalid.").
   assert.match(step, /\.is_error == true/);
   assert.match(step, /total_cost_usd \/\/ 0\) == 0/);
-  assert.match(step, /failed to authenticate/);
+  assert.match(step, /failed to authenticate\|authentication_error/);
+  assert.match(step, /EXECUTION_FILE: '\$\{\{ steps\.claude\.outputs\.execution_file \}\}'/);
   assert.match(step, /exit 1/);
 });
 

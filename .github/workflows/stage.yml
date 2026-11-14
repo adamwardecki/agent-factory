@@ -118,10 +118,12 @@ jobs:
       # says to renew the token. The step fails only for that; for any other failure it passes.
       - name: Claude refused the credential
         if: ${{ !cancelled() && steps.claude.outcome == 'failure' }}
+        # The action names its output file; the path it uses today is the fallback.
+        env: { EXECUTION_FILE: '${{ steps.claude.outputs.execution_file }}' }
         run: |
-          f="$RUNNER_TEMP/claude-execution-output.json"
+          f="${EXECUTION_FILE:-$RUNNER_TEMP/claude-execution-output.json}"
           [[ -f "$f" ]] || exit 0
-          if jq -e '[.[] | select(.type == "result")] | last | select(.is_error == true and (.total_cost_usd // 0) == 0) | ((.result // "") + " " + ((.errors // []) | map(tostring) | join(" "))) | test("failed to authenticate|invalid bearer|oauth access token"; "i")' "$f" >/dev/null; then
+          if jq -e '[.[] | select(.type == "result")] | last | select(.is_error == true and (.total_cost_usd // 0) == 0) | ((.result // "") + " " + ((.errors // []) | map(tostring) | join(" "))) | test("failed to authenticate|authentication_error|invalid bearer|oauth access token"; "i")' "$f" >/dev/null; then
             echo "::error::Claude refused the credential. Renew it: claude setup-token, then gh secret set CLAUDE_CODE_OAUTH_TOKEN."
             exit 1
           fi
