@@ -40,7 +40,7 @@ export function client(token: string, repo: string): Gh {
   return { repo, call };
 }
 
-async function paged(gh: Gh, path: string): Promise<unknown[]> {
+export async function paged(gh: Gh, path: string): Promise<unknown[]> {
   const out: unknown[] = [];
   for (let page = 1; ; page++) {
     const batch = rows(await gh.call('GET', `${path}${path.includes('?') ? '&' : '?'}per_page=100&page=${page}`));
@@ -159,12 +159,14 @@ export async function getRun(gh: Gh, id: number): Promise<unknown> {
   return gh.call('GET', `/repos/${gh.repo}/actions/runs/${id}`);
 }
 
-export type Job = { name: string; conclusion: string | null; status: string };
+export type Step = { name: string; conclusion: string | null };
+export type Job = { name: string; conclusion: string | null; status: string; steps?: Step[] };
 export async function runJobs(gh: Gh, id: number): Promise<Job[]> {
   return rows(dig(await gh.call('GET', `/repos/${gh.repo}/actions/runs/${id}/jobs?per_page=100`), 'jobs')).map((j) => ({
     name: str(dig(j, 'name')),
     conclusion: str(dig(j, 'conclusion')) || null,
     status: str(dig(j, 'status')),
+    steps: rows(dig(j, 'steps')).map((s) => ({ name: str(dig(s, 'name')), conclusion: str(dig(s, 'conclusion')) || null })),
   }));
 }
 

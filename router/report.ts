@@ -4,7 +4,7 @@
 // the run it names is this repo's stage run for that stage, issue and attempt. A forged "success" still can't move
 // an issue on: decide.ts then checks the stage's real output (a signed brief, PR or review).
 
-import { parseRunTitle, type RunWorkflow } from './config.ts';
+import { CREDENTIAL_STEP, parseRunTitle, type RunWorkflow } from './config.ts';
 import type { RunSnapshot } from './decide.ts';
 import type { Report } from './events.ts';
 import type { Job } from './github.ts';
@@ -18,6 +18,8 @@ const job = (jobs: readonly Job[], name: string) => jobs.find((j) => j.name === 
 // they could tell. The last job is still running when it reports, so its own word stands in for its conclusion.
 export function conclude(workflow: RunWorkflow, jobs: readonly Job[], reported?: 'success' | 'failure'): string {
   if (jobs.some((j) => j.conclusion === 'cancelled')) return 'cancelled';
+  // The agent job's credential step fails only when Claude refused the credential before its first model call.
+  if (workflow !== 'verify' && job(jobs, 'agent')?.steps?.some((s) => s.name === CREDENTIAL_STEP && s.conclusion === 'failure')) return 'credential';
   const ok = (name: string) => job(jobs, name)?.conclusion === 'success';
   if (workflow === 'verify') {
     if (!ok('prepare')) return 'startup_failure';

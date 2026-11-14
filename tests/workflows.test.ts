@@ -5,6 +5,7 @@
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import { test } from 'node:test';
+import { CALLER_INTERFACE, CREDENTIAL_STEP } from '../router/config.ts';
 import { parseRepoConfig } from '../router/repo-config.ts';
 import { allowedTools } from '../router/tools.ts';
 import { CALLERS, callerVars, render } from '../scripts/render-callers.ts';
@@ -314,5 +315,31 @@ test('no plain YAML value in a workflow holds ": " (sandbox trial: GitHub refuse
       const m = /^\s*(?:- )?[\w-]+: (\$\{\{.*)$/.exec(line);
       if (m?.[1]) assert.ok(!m[1].includes(': '), `${f}:${n + 1}: quote it or fold it`);
     });
+  }
+});
+
+test('the agent job says when Claude refused the credential, in a step the router reads from the jobs API', () => {
+  const stage = read('.github/workflows/stage.yml');
+  assert.match(stage, /- id: claude\n\s+uses: anthropics\/claude-code-action@/);
+  const at = stage.indexOf(`- name: ${CREDENTIAL_STEP}\n`);
+  assert.ok(at > stage.indexOf('uses: anthropics/claude-code-action@'), 'after the Claude step');
+  const step = stage.slice(at, stage.indexOf('\n      - ', at + 1));
+  assert.match(step, /if: \$\{\{ !cancelled\(\) && steps\.claude\.outcome == 'failure' \}\}/);
+  // Only a refusal before any model call: an error result at no cost, with the API's authentication message
+  // (sandbox trial: "Failed to authenticate. API Error: 401 OAuth access token is invalid.").
+  assert.match(step, /\.is_error == true/);
+  assert.match(step, /total_cost_usd \/\/ 0\) == 0/);
+  assert.match(step, /failed to authenticate/);
+  assert.match(step, /exit 1/);
+});
+
+test('the reusable workflows and the templates speak the interface the CLI reads from a release', () => {
+  // upgrade reads CALLER_INTERFACE from a release's router/config.ts; the workflows' own check has to agree with it.
+  for (const f of ['.github/workflows/router.yml', '.github/workflows/stage.yml', '.github/workflows/verify.yml']) {
+    assert.match(read(f), new RegExp(`\\[\\[ "\\$INTERFACE" == "${CALLER_INTERFACE}" \\]\\]`), f);
+  }
+  for (const f of ['templates/factory-router.yml', 'templates/factory-stage.yml']) {
+    const lines = [...read(f).matchAll(/^\s+interface: (\d+)$/gm)].map((m) => Number(m[1]));
+    assert.ok(lines.length > 0 && lines.every((n) => n === CALLER_INTERFACE), f);
   }
 });

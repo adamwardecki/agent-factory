@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { CREDENTIAL_STEP } from '../router/config.ts';
 import { checkReport, conclude, runSnapshot } from '../router/report.ts';
 
 const run = {
@@ -97,4 +98,17 @@ test('a run whose jobs have all finished counts as finished before the run itsel
   // Without the reporting job there is nothing to go on, and a job still running means the run is not over.
   assert.equal(runSnapshot({ ...run, display_title: 'factory-verify #49 mhs1abc', status: 'in_progress' }, allDone.slice(0, 2), 'o/r', NOW)?.completedAt, null);
   assert.equal(runSnapshot({ ...run, display_title: 'factory-verify #49 mhs1abc', status: 'in_progress' }, [...allDone.slice(0, 2), { name: 'verify / report', conclusion: null, status: 'in_progress' }], 'o/r', NOW)?.completedAt, null);
+});
+
+test('an agent job whose credential step failed reads as a refused credential, and only that step counts', () => {
+  const agent = (steps: { name: string; conclusion: string | null }[]) => [
+    { name: 'stage / prepare', conclusion: 'success', status: 'completed' },
+    { name: 'stage / agent', conclusion: 'failure', status: 'completed', steps },
+    { name: 'stage / publish', conclusion: 'success', status: 'completed' },
+  ];
+  assert.equal(conclude('build', agent([{ name: CREDENTIAL_STEP, conclusion: 'failure' }])), 'credential');
+  assert.equal(conclude('build', agent([{ name: CREDENTIAL_STEP, conclusion: 'success' }])), 'failure', 'checked and passed: another failure');
+  assert.equal(conclude('build', agent([{ name: CREDENTIAL_STEP, conclusion: 'skipped' }])), 'failure');
+  assert.equal(conclude('build', agent([{ name: 'Run tests', conclusion: 'failure' }])), 'failure');
+  assert.equal(conclude('build', agent([])), 'failure');
 });

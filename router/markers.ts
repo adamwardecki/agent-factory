@@ -10,7 +10,7 @@ export type FixReason = (typeof FIX_REASONS)[number];
 // Why an issue is blocked; /retry picks its way back in from this. 'human' is a planner that asked for one; 'no-pr'
 // is a verify, review or fix round with no PR whose diff the gate could check; 'key-rotated' is state signed with a
 // signing key that was replaced, which only a fresh agent:queued label restarts.
-export const BLOCK_REASONS = ['rounds', 'rebases', 'attempts', 'stuck', 'stop', 'human', 'no-pr', 'key-rotated'] as const;
+export const BLOCK_REASONS = ['rounds', 'rebases', 'attempts', 'stuck', 'stop', 'human', 'no-pr', 'key-rotated', 'credential'] as const;
 export type BlockReason = (typeof BLOCK_REASONS)[number];
 
 export const COMMANDS = ['approve', 'stop', 'retry'] as const;

@@ -39,7 +39,8 @@ export type RunSnapshot = {
   workflow: RunWorkflow;
   attempt: string | null; // from the run's title
   // For an agent stage: 'success' only if prepare, agent and publish all succeeded. For verify: 'success' or 'failure'
-  // is the result of the checks; anything else means the run broke before it could tell.
+  // is the result of the checks; anything else means the run broke before it could tell. 'credential': the agent
+  // job's credential step says Claude refused the credential.
   conclusion: string | null;
   url: string;
   completedAt: string | null; // null while the run is still going
@@ -135,6 +136,9 @@ export function decideEvent(ev: FactoryEvent, snap: IssueSnapshot, ctx: Ctx): Ac
       return [...enter(ev.issue, st, 'done', ctx), ...cancelRun(ev.issue, st)];
   }
 }
+
+const CREDENTIAL_REFUSED =
+  'Claude refused the credential before its first model call; the subscription token has probably expired. Renew it: run `claude setup-token`, then `gh secret set CLAUDE_CODE_OAUTH_TOKEN` for this repo.';
 
 function block(issue: number, prev: FactoryState, reason: string, blockedFor: BlockReason, ctx: Ctx): Action[] {
   const blockedFrom = prev.stage === 'blocked' ? prev.blockedFrom : prev.stage;
@@ -261,6 +265,8 @@ function runFinished(issue: number, st: FactoryState, snap: IssueSnapshot, run: 
   if (run.conclusion === 'skipped') return [];
   const seen: FactoryState = { ...st, runs: [...st.runs, run.url] };
   if (expected === 'verify') return verified(issue, seen, snap, run, ctx);
+  // Retrying can't help until someone renews the credential, so the issue stops now and says how, once.
+  if (run.conclusion === 'credential') return block(issue, seen, CREDENTIAL_REFUSED, 'credential', ctx);
   if (run.conclusion !== 'success') return fail(issue, seen, `the ${expected} run ended with "${run.conclusion}"`, ctx);
   switch (expected) {
     case 'plan':

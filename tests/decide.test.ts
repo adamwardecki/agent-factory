@@ -165,6 +165,20 @@ test('a run of the current attempt that was cancelled counts as failed: a job th
   assert.equal(saves(v)[0]?.attempts, 1);
 });
 
+test('a refused credential blocks the issue at once and says to renew the token', () => {
+  for (const [stage, workflow] of [['planning', 'plan'], ['building', 'build'], ['fixing', 'fix']] as const) {
+    const a = finished(snap(st(stage, { pr: 51, headSha: 'sha-0' }), { pr: pr() }), run(workflow, 'credential'));
+    assert.deepEqual(stages(a), ['blocked'], stage);
+    assert.equal(saves(a)[0]?.blockedFor, 'credential');
+    assert.equal(saves(a)[0]?.blockedFrom, stage);
+    assert.match(comments(a)[0] ?? '', /claude setup-token/);
+    assert.match(comments(a)[0] ?? '', /gh secret set CLAUDE_CODE_OAUTH_TOKEN/);
+  }
+  // /retry after renewing starts the stage again.
+  const again = cmd(snap(st('blocked', { blockedFrom: 'building', blockedFor: 'credential' })), 'retry');
+  assert.deepEqual(stages(again), ['building']);
+});
+
 test('a build that opened a signed PR goes to verify on its head', () => {
   const a = finished(snap(st('building'), { pr: pr() }), run('build'));
   assert.deepEqual(stages(a), ['ci']);
