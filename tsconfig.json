@@ -13,5 +13,5 @@
     "allowImportingTsExtensions": true,
     "skipLibCheck": true
   },
-  "include": ["router/**/*.ts", "tests/**/*.ts", "scripts/**/*.ts"]
+  "include": ["router/**/*.ts", "cli/**/*.ts", "tests/**/*.ts", "scripts/**/*.ts"]
 }
