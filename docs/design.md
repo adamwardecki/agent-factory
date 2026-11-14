@@ -808,6 +808,8 @@ labels, signing key, dry-run variable or PR setting; only the Claude token kept.
   - **Decided after the trial:** only `.github/**` and dependency changes go to a person. The planner now lists
     other edits to agent instructions, manifests and lockfiles under Touches, so they wait for `/approve` like
     any risky path; the builder and fixer may change them only when Touches list them.
+    Checked the same day: the same issue, retried on the new pin, stopped for `/approve` naming `package.json`.
+    After the approval it reached ready with a PR that adds the script, changes no dependency and tests the script.
 - **The approve flow, with a repo risky path:**
   - **Setup:** `"riskyPaths": ["src/**"]` added to the sandbox's config, then "add `cube(n)` to `src/math.js`"
     queued.
