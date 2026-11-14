@@ -283,3 +283,13 @@ test('agent-setup uses no action with a post step: its directory has left the wo
     assert.ok(at(setup) > 0 && at(setup) < at('uses: ./.factory-src/actions/agent-setup'), `${setup} runs in the job, before agent-setup's install`);
   }
 });
+
+test('Claude Code adds no co-author trailer to the agent\'s commits, and the skills say why', () => {
+  // Claude Code's default attribution adds a Co-Authored-By trailer, which the publish job refuses (sandbox trial,
+  // build run 1). Both settings: `attribution` is the current one, `includeCoAuthoredBy` the older one.
+  const stage = read('.github/workflows/stage.yml');
+  assert.match(stage, /settings: '\{"attribution": \{"commit": "", "pr": ""\}, "includeCoAuthoredBy": false\}'/);
+  for (const skill of ['skills/factory-build/SKILL.md', 'skills/factory-fix/SKILL.md']) {
+    assert.match(read(skill), /no Co-authored-by trailer/, skill);
+  }
+});

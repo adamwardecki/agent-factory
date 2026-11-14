@@ -22,7 +22,8 @@ You are the fixer in the agent factory. You are on branch `factory/issue-$ARGUME
 - You cannot push or comment, and you don't need to. Why: a separate job checks your output, pushes and comments.
 - Change nothing under `.github/`, no agent instructions (`AGENTS.md`, `CLAUDE.md`, `.claude/`), and no dependency
   manifest or lockfile unless the brief's Touches list it. Add no symlink or submodule. Never change the commit
-  author or committer. Why: same rules as the builder.
+  author or committer, and write no Co-authored-by trailer or closing keyword in a commit message. Why: same rules
+  as the builder.
 - Never merge. Never fetch. Why: the repo's branches are rebased, a merge commit is refused, and you have no
   credentials to fetch with: every commit you need is already in the checkout.
 - Never write the text `factory:sig`, `factory:attempt` or `factory:state` in your output files. Why: output that
