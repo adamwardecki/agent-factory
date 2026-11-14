@@ -105,7 +105,9 @@ jobs:
             --max-turns ${{ needs.prepare.outputs.max-turns }}
             --allowedTools "${{ needs.prepare.outputs.allowed-tools }}"
           # Claude Code's default attribution adds a Co-Authored-By trailer to commits; the publish job refuses those.
-          settings: '{"attribution": {"commit": "", "pr": ""}, "includeCoAuthoredBy": false}'
+          # The action puts the job's token in Claude's environment for gh. Only the planner uses gh; in the other
+          # stages the token is emptied, so the repo's tests, which have network, never see it.
+          settings: ${{ inputs.stage == 'plan' && '{"attribution": {"commit": "", "pr": ""}, "includeCoAuthoredBy": false}' || '{"attribution": {"commit": "", "pr": ""}, "includeCoAuthoredBy": false, "env": {"GITHUB_TOKEN": "", "GH_TOKEN": ""}}' }}
           plugin_marketplaces: ${{ runner.temp }}/mp-skills
           plugins: mattpocock-skills@mattpocock
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

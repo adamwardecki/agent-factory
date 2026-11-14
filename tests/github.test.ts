@@ -37,6 +37,40 @@ test('pullSnapshot lists both sides of a rename', async () => {
   assert.deepEqual(snap.files, ['docs/gates.ts', 'plugin/hooks/gates.ts', 'docs/setup.md']);
 });
 
+test('pullSnapshot asks again while GitHub is still working out whether the PR conflicts', async () => {
+  // Right after a merge to the base, mergeable_state is 'unknown' and GitHub starts computing it (sandbox trial: the
+  // router run woken by the merge read a conflicting PR as clean).
+  const states = (seq: string[], state = 'open') => {
+    let gets = 0;
+    const gh: Gh = {
+      repo: 'o/r',
+      call: async (_method, path) => {
+        if (path.includes('/files')) return [];
+        gets++;
+        return { head: { sha: 'abc' }, state, mergeable_state: seq[Math.min(gets, seq.length) - 1], node_id: 'PR_1' };
+      },
+    };
+    return { gh, gets: () => gets };
+  };
+  const waits: number[] = [];
+  const wait = async (ms: number) => {
+    waits.push(ms);
+  };
+  const late = states(['unknown', 'unknown', 'dirty']);
+  assert.equal((await pullSnapshot(late.gh, 51, wait)).conflicting, true);
+  assert.equal(late.gets(), 3);
+  assert.ok(waits.length === 2 && waits.every((ms) => ms > 0));
+  const never = states(['unknown']);
+  assert.equal((await pullSnapshot(never.gh, 51, wait)).conflicting, false, 'gives up and reads it as not conflicting');
+  assert.ok(never.gets() <= 6, 'a bounded number of tries');
+  const closed = states(['unknown'], 'closed');
+  await pullSnapshot(closed.gh, 51, wait);
+  assert.equal(closed.gets(), 1, 'a closed PR is not asked again');
+  const clean = states(['clean']);
+  await pullSnapshot(clean.gh, 51, wait);
+  assert.equal(clean.gets(), 1);
+});
+
 test('latestLabeler reads the newest labelling of that label across timeline pages', async () => {
   const labeled = (name: string, login: string, at: string) => ({ event: 'labeled', label: { name }, actor: { login }, created_at: at });
   const first = [

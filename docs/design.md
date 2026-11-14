@@ -745,15 +745,16 @@ Run 2026-11-14, with the four fixes above pinned. No new bugs in the factory's c
   visible environment. `$RUNNER_TEMP` is writable (the moved factory checkout, the skills, Claude's prompts, scripts
   of steps that already ran); nothing there runs again after Claude. In verify: an empty environment, 5 processes,
   `_actions` not visible, `$RUNNER_TEMP` a throwaway tmpfs.
-- **Open: the read-only `GITHUB_TOKEN` is in the test's environment** (as `GITHUB_TOKEN` and `GH_TOKEN`) in build and
-  fix, and tests have network. On a public repo that exposes nothing new; on a private one, test code could read
-  the repo's issues, PRs, other runs' logs and artifacts while the job lasts. Build and fix don't need it, so the fix is to
-  keep it out of their agent job.
-- **Open: a PR that a merge made conflicting is seen only by the next sweep.** GitHub works out mergeability after
-  the merge's event, so the router run that event wakes still reads the PR as clean. With scheduled runs as
-  irregular as in this trial, the rebase waited for a sweep started by hand.
-- **Cosmetic:** for about 20 seconds an issue carried two stage labels (`agent:ci` and `agent:in-review`): the new
-  label is added before the old one is removed.
+- **Fixed after the round: the read-only `GITHUB_TOKEN` was in the test's environment** (as `GITHUB_TOKEN` and
+  `GH_TOKEN`) in build and fix, and tests have network. `claude-code-action` puts the job's token in Claude's
+  environment for `gh`; only the planner uses `gh`, so the other stages set both to empty in Claude Code's `env`
+  setting.
+- **Fixed after the round: a PR that a merge made conflicting was seen only by the next sweep.** Right after a
+  push to a PR or its base, GitHub reports `mergeable_state: unknown` while it works the answer out, so the router run
+  that the merge woke read the PR as clean. The PR read now asks again, up to five times two seconds apart, while
+  the state is `unknown`.
+- **Not a bug:** an issue carries two stage labels for under a second while it changes stage (the new label is
+  added, then the old one removed, so it is never without one; the router finds issues by those labels).
 
 ## Limitations
 

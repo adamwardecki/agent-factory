@@ -289,7 +289,18 @@ test('Claude Code adds no co-author trailer to the agent\'s commits, and the ski
   // Claude Code's default attribution adds a Co-Authored-By trailer, which the publish job refuses (sandbox trial,
   // build run 1). Both settings: `attribution` is the current one, `includeCoAuthoredBy` the older one.
   const stage = read('.github/workflows/stage.yml');
-  assert.match(stage, /settings: '\{"attribution": \{"commit": "", "pr": ""\}, "includeCoAuthoredBy": false\}'/);
+  const settings = /settings: \$\{\{ inputs\.stage == 'plan' && '(.+)' \|\| '(.+)' \}\}/.exec(stage);
+  assert.ok(settings?.[1] && settings[2], 'settings depend on the stage');
+  const plan = JSON.parse(settings[1]);
+  const other = JSON.parse(settings[2]);
+  for (const s of [plan, other]) {
+    assert.deepEqual(s.attribution, { commit: '', pr: '' });
+    assert.equal(s.includeCoAuthoredBy, false);
+  }
+  // The planner reads the issue with gh. Build and fix run the repo's tests, which have network: the job's token must
+  // not be in their environment (sandbox trial, containment probe). Review needs no gh either.
+  assert.equal(plan.env, undefined);
+  assert.deepEqual(other.env, { GITHUB_TOKEN: '', GH_TOKEN: '' });
   for (const skill of ['skills/factory-build/SKILL.md', 'skills/factory-fix/SKILL.md']) {
     assert.match(read(skill), /no Co-authored-by trailer/, skill);
   }

@@ -117,8 +117,19 @@ export async function findOpenPull(gh: Gh, issue: number): Promise<number | null
 }
 
 // signed and attempt come from the body's signed footer, which snapshot.ts checks.
-export async function pullSnapshot(gh: Gh, pr: number): Promise<Omit<PullSnapshot, 'signed' | 'attempt'> & { nodeId: string; body: string }> {
-  const p = await gh.call('GET', `/repos/${gh.repo}/pulls/${pr}`);
+// GitHub works out whether an open PR conflicts in the background, after a push to it or its base, and says
+// 'unknown' until then; asking starts the work. Right after a merge, the router run that the merge woke would
+// otherwise read a PR the merge made conflicting as clean, and leave it to a sweep.
+const MERGEABLE_TRIES = 5;
+const MERGEABLE_WAIT_MS = 2000;
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+export async function pullSnapshot(gh: Gh, pr: number, wait: (ms: number) => Promise<void> = sleep): Promise<Omit<PullSnapshot, 'signed' | 'attempt'> & { nodeId: string; body: string }> {
+  let p = await gh.call('GET', `/repos/${gh.repo}/pulls/${pr}`);
+  for (let i = 1; i < MERGEABLE_TRIES && dig(p, 'state') === 'open' && dig(p, 'mergeable_state') === 'unknown'; i++) {
+    await wait(MERGEABLE_WAIT_MS);
+    p = await gh.call('GET', `/repos/${gh.repo}/pulls/${pr}`);
+  }
   // A rename lists its old path too: moving a file out of a risky directory changes that directory.
   const files = (await paged(gh, `/repos/${gh.repo}/pulls/${pr}/files`)).flatMap((f) => {
     const old = str(dig(f, 'previous_filename'));
