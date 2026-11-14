@@ -20,8 +20,9 @@ You are the fixer in the agent factory. You are on branch `factory/issue-$ARGUME
 - Run only the commands under **Checks**, exactly as written, and git. Why: no other command is allowed, and the
   factory runs the same checks on your commits afterwards.
 - You cannot push or comment, and you don't need to. Why: a separate job checks your output, pushes and comments.
-- Change nothing under `.github/`, no agent instructions (`AGENTS.md`, `CLAUDE.md`, `.claude/`), and no dependency
-  manifest or lockfile unless the brief's Touches list it. Add no symlink or submodule. Never change the commit
+- Change nothing under `.github/`. Change agent instructions (`AGENTS.md`, `CLAUDE.md`, `.claude/`), a dependency
+  manifest or a lockfile only if the brief's Touches list them, and never add, remove or change a dependency. Add no
+  symlink or submodule. Never change the commit
   author or committer, and write no Co-authored-by trailer or closing keyword in a commit message. Why: same rules
   as the builder.
 - Never merge. Never fetch. Why: the repo's branches are rebased, a merge commit is refused, and you have no

@@ -355,3 +355,20 @@ test('the agent job says when Claude hit the subscription\'s usage limit, right 
   assert.match(step, /hit your .*limit/);
   assert.match(step, /exit 1/);
 });
+
+test('guarded files: the planner lists agent instructions and manifest edits for /approve, and keeps .github/ and dependencies for a person', () => {
+  // Sandbox trial: the planner refused a one-line package.json script, so the /approve gate could never be reached
+  // for the baseline risky paths. Now only .github/ and dependency changes go to a person.
+  const plan = read('skills/factory-plan/SKILL.md');
+  const human = plan.slice(plan.indexOf('`ready-for-human`'), plan.indexOf('Other changes to agent instructions'));
+  assert.match(human, /a change under `\.github\/`/);
+  assert.match(human, /adds, removes or changes a dependency/);
+  assert.doesNotMatch(human, /agent instructions/, 'agent instructions are no longer a reason by themselves');
+  assert.match(plan, /list them under \*\*Touches\*\*.*\/approve/s);
+  for (const skill of ['skills/factory-build/SKILL.md', 'skills/factory-fix/SKILL.md']) {
+    const text = read(skill);
+    assert.match(text, /Change nothing under `\.github\/`/, skill);
+    assert.match(text, /only if the brief's Touches list (it|them)/, skill);
+    assert.match(text, /never add, remove or change a dependency/i, skill);
+  }
+});

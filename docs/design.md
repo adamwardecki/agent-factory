@@ -805,7 +805,9 @@ labels, signing key, dry-run variable or PR setting; only the Claude token kept.
   - **Why the gate didn't run:** the baseline risky paths (`.github/**`, agent instructions, manifests and
     lockfiles) never reach the `/approve` gate. The skills send them to a person first. Only a repo's own
     `riskyPaths` lead to approve-then-build.
-  - **Open question before phase 3:** should agent instructions and manifests be changeable after `/approve`?
+  - **Decided after the trial:** only `.github/**` and dependency changes go to a person. The planner now lists
+    other edits to agent instructions, manifests and lockfiles under Touches, so they wait for `/approve` like
+    any risky path; the builder and fixer may change them only when Touches list them.
 - **The approve flow, with a repo risky path:**
   - **Setup:** `"riskyPaths": ["src/**"]` added to the sandbox's config, then "add `cube(n)` to `src/math.js`"
     queued.

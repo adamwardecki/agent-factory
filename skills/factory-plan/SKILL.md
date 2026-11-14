@@ -41,11 +41,17 @@ You are the planner in the agent factory. You turn issue #$ARGUMENTS into an age
    - `ready-for-human`: `comment.md` says which of these cases applies and why:
      - the work needs judgement, outside access or manual testing;
      - it asks to weaken a safety check the repo's docs describe;
-     - it needs a change under `.github/`, to agent instructions (`AGENTS.md`, `CLAUDE.md`, `.claude/`), or to a
-       dependency manifest or lockfile. Why: the factory installs dependencies from the default branch, so an agent
-       can't test against a new one, and only maintainers change what agents and workflows load;
+     - it needs a change under `.github/`. Why: the factory can't push workflow files, and they decide what runs
+       with the repo's secrets;
+     - it adds, removes or changes a dependency. Why: the agent installs dependencies from the default branch, so
+       it can't build or test against a new one;
      - it needs a new symlink or submodule;
      - you would recommend `wontfix`.
+
+   Other changes to agent instructions (`AGENTS.md`, `CLAUDE.md`, `.claude/`) or to a dependency manifest or
+   lockfile (a script, a version number) are `ready-for-agent`: list them under **Touches** like any other file. Why:
+   they are risky paths, so the factory stops for a maintainer's `/approve` before anything is built, and the
+   maintainer sees exactly which of them the work will change.
 
 ## The brief
 
