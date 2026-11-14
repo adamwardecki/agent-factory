@@ -19,6 +19,16 @@ jobs:
           node-version: 24.x
       - run: npm ci
       - run: npx --no biome ci .
+  # GitHub refuses a workflow it can't parse only when something calls it, which here is another repo's dispatch.
+  # The ignores are keys actionlint doesn't know yet: queue (phase 0, check 8) and job.workflow_* (check 9).
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+      - uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
+        with:
+          args: -color -ignore unexpected.key..queue. -ignore property..workflow_(sha|repository)..is.not.defined .github/workflows/ci.yml .github/workflows/router.yml .github/workflows/stage.yml .github/workflows/verify.yml
   test:
     strategy:
       fail-fast: false

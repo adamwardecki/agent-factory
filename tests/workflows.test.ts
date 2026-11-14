@@ -24,12 +24,14 @@ function section(yml: string, name: string): string {
   return end === -1 ? rest : rest.slice(0, end + 1);
 }
 
-test('every action is pinned to a full commit SHA', () => {
+test('every action is pinned to a full commit SHA, and every image to a digest', () => {
   for (const f of [...WORKFLOWS, ...ACTIONS]) {
     for (const m of read(f).matchAll(/uses:\s*([^\s#]+)/g)) {
       const ref = m[1] ?? '';
       if (ref.startsWith('./')) continue;
-      assert.match(ref, /@[0-9a-f]{40}$/, `${f}: ${ref}`);
+      // A container image is pinned the same way, by its digest.
+      if (ref.startsWith('docker://')) assert.match(ref, /@sha256:[0-9a-f]{64}$/, `${f}: ${ref}`);
+      else assert.match(ref, /@[0-9a-f]{40}$/, `${f}: ${ref}`);
     }
   }
 });
@@ -289,7 +291,7 @@ test('Claude Code adds no co-author trailer to the agent\'s commits, and the ski
   // Claude Code's default attribution adds a Co-Authored-By trailer, which the publish job refuses (sandbox trial,
   // build run 1). Both settings: `attribution` is the current one, `includeCoAuthoredBy` the older one.
   const stage = read('.github/workflows/stage.yml');
-  const settings = /settings: \$\{\{ inputs\.stage == 'plan' && '(.+)' \|\| '(.+)' \}\}/.exec(stage);
+  const settings = /settings: >-\n\s+\$\{\{ inputs\.stage == 'plan' && '(.+)' \|\| '(.+)' \}\}/.exec(stage);
   assert.ok(settings?.[1] && settings[2], 'settings depend on the stage');
   const plan = JSON.parse(settings[1]);
   const other = JSON.parse(settings[2]);
@@ -303,5 +305,14 @@ test('Claude Code adds no co-author trailer to the agent\'s commits, and the ski
   assert.deepEqual(other.env, { GITHUB_TOKEN: '', GH_TOKEN: '' });
   for (const skill of ['skills/factory-build/SKILL.md', 'skills/factory-fix/SKILL.md']) {
     assert.match(read(skill), /no Co-authored-by trailer/, skill);
+  }
+});
+
+test('no plain YAML value in a workflow holds ": " (sandbox trial: GitHub refused stage.yml for one)', () => {
+  for (const f of [...WORKFLOWS, ...ACTIONS, 'templates/factory-router.yml', 'templates/factory-stage.yml']) {
+    read(f).split('\n').forEach((line, n) => {
+      const m = /^\s*(?:- )?[\w-]+: (\$\{\{.*)$/.exec(line);
+      if (m?.[1]) assert.ok(!m[1].includes(': '), `${f}:${n + 1}: quote it or fold it`);
+    });
   }
 });
