@@ -6,6 +6,7 @@
   "engines": { "node": ">=22.18" },
   "scripts": {
     "test": "node --no-warnings --test tests/*.test.ts",
+    "factory": "node --no-warnings cli/factory.ts",
     "typecheck": "tsc",
     "lint": "biome check .",
     "lint:fix": "biome check --write ."
