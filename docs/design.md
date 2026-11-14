@@ -724,6 +724,37 @@ Also seen: no scheduled sweep ran for about four hours after the callers were fi
 waited that long. Scheduled workflows can start late on a new or quiet repo; a report or a comment wakes the router
 at once.
 
+### Second round: more issues, the failure paths and containment
+
+Run 2026-11-14, with the four fixes above pinned. No new bugs in the factory's code.
+
+- **Admission:** a second issue queued while one was in review stayed `queued` and started in the router run that
+  moved the first to `ready`. A changes-requested review on a ready PR, while another issue held the one slot,
+  parked it in `waiting`; it ran fix, verify and review once the slot freed, and came back to `ready`.
+- **Rebase over a person's commit (finding 2):** a maintainer commit on the PR branch, then a merge that made the PR
+  conflict. The fix stage rebased, resolved the conflict (kept both functions), and the contract accepted the
+  carried commit (author the maintainer, committer the bot).
+- **Timeouts (finding 4):** a job that hits `timeout-minutes` reports `cancelled`, and so does its run. A later job
+  with `if: ${{ !cancelled() }}` still runs, as does one with `always()`: `cancelled()` is only true when the run
+  itself was cancelled. So a timed-out stage still reports, and the router counts it as a failed attempt.
+- **Sandbox home (finding 1):** a `pip install --user` in one `sandboxed.sh` call was there in the next, and a
+  virtualenv in the workspace works.
+- **Containment (finding 5),** from a probe test that the build's agent and verify both ran. In the agent job,
+  under the env scrub: `sudo` refused; `_actions`, `/usr` and the runner's file-command files (`GITHUB_ENV`,
+  `GITHUB_PATH`) read-only; 7 processes visible; no `CLAUDE_CODE_OAUTH_TOKEN` or `ACTIONS_RUNTIME_TOKEN` in any
+  visible environment. `$RUNNER_TEMP` is writable (the moved factory checkout, the skills, Claude's prompts, scripts
+  of steps that already ran); nothing there runs again after Claude. In verify: an empty environment, 5 processes,
+  `_actions` not visible, `$RUNNER_TEMP` a throwaway tmpfs.
+- **Open: the read-only `GITHUB_TOKEN` is in the test's environment** (as `GITHUB_TOKEN` and `GH_TOKEN`) in build and
+  fix, and tests have network. On a public repo that exposes nothing new; on a private one, test code could read
+  the repo's issues, PRs, other runs' logs and artifacts while the job lasts. Build and fix don't need it, so the fix is to
+  keep it out of their agent job.
+- **Open: a PR that a merge made conflicting is seen only by the next sweep.** GitHub works out mergeability after
+  the merge's event, so the router run that event wakes still reads the PR as clean. With scheduled runs as
+  irregular as in this trial, the rebase waited for a sweep started by hand.
+- **Cosmetic:** for about 20 seconds an issue carried two stage labels (`agent:ci` and `agent:in-review`): the new
+  label is added before the old one is removed.
+
 ## Limitations
 
 - **One manual step per repo:** in `oauth_token` mode, `claude setup-token` and `gh secret set`, and the token

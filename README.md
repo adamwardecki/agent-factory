@@ -7,8 +7,8 @@ There is no GitHub App. Agents hold a read-only token and write their output to 
 job checks that output and makes every write with the workflow's `GITHUB_TOKEN`.
 
 **Status:** pre-release. The GitHub behaviour the design rests on was checked with probe workflows in a sandbox repo,
-and one issue has gone from `agent:queued` to a ready PR there (`docs/design.md`, "Phase 0 results" and "Sandbox
-trial"). The failure paths have not been tried on GitHub yet.
+and three issues have gone from `agent:queued` to ready PRs there, through a maintainer's change request, the queue
+and a rebase (`docs/design.md`, "Phase 0 results" and "Sandbox trial").
 
 ## How a stage runs
 
