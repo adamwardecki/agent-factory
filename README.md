@@ -6,9 +6,9 @@ Actions. A maintainer queues issues and merges PRs; agents plan, build, review a
 There is no GitHub App. Agents hold a read-only token and write their output to files. A separate, deterministic
 job checks that output and makes every write with the workflow's `GITHUB_TOKEN`.
 
-**Status:** pre-release. The GitHub behaviour the design rests on was checked with probe workflows in a sandbox repo
-(`docs/design.md`, "Phase 0 results"); the workflows in this repo have not run yet. One check is open: a real Claude
-run with a read-only token.
+**Status:** pre-release. The GitHub behaviour the design rests on was checked with probe workflows in a sandbox repo,
+and one issue has gone from `agent:queued` to a ready PR there (`docs/design.md`, "Phase 0 results" and "Sandbox
+trial"). The failure paths have not been tried on GitHub yet.
 
 ## How a stage runs
 

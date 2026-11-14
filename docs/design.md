@@ -702,6 +702,28 @@ The probe workflows and their runs stay in that repo.
 For `oidc` mode, before phase 4: that the token exchange works from a reusable workflow called by the target repo,
 whether the Console can match `job_workflow_ref`, and that the scrub keeps working.
 
+## Sandbox trial (phase 2, first issue)
+
+Run 2026-11-13 to 14 in `agent-factory-sandbox`: one issue ("add a `multiply` function" to a tiny Node project)
+from `agent:queued` to a ready PR. The dry run logged the expected actions and wrote nothing. Live, it found four
+bugs, each fixed test-first and re-pinned:
+
+| Run | What broke | Fix |
+|---|---|---|
+| plan 1 | GitHub refused to load `agent-setup`: composite action steps can't take `timeout-minutes`. | The apt install carries `timeout 300` instead. |
+| plan 2 | Claude finished, then the job failed: the runner reads a composite action's file again for its nested post steps (`setup-node`), and the job had moved the factory checkout out of the workspace. | `setup-node` and `setup-python` run in the job, before `agent-setup`. |
+| build 1 | The publish job refused the commit: Claude Code adds a `Co-Authored-By` trailer by default. The contract worked as designed. | `attribution` (and the older `includeCoAuthoredBy`) off in the action's settings; the build and fix skills say why. |
+| verify 1 | The checks passed but the report never went out: `gh workflow run` looks up the default branch, which `actions: write` alone can't. | The report job also gets `contents: read`. |
+
+After those: the plan's brief named the right touches; the build pushed one commit as `github-actions[bot]` and
+opened a signed draft PR; verify ran `npm ci` and `npm test` in the sandbox; the review found nothing blocking; the
+router marked the PR ready and requested the maintainer's review. The repo's own CI waited for approval
+(`action_required`), as designed. Claude cost about $0.22 for the plan, $0.11 for the build.
+
+Also seen: no scheduled sweep ran for about four hours after the callers were first committed, so the hourly retry
+waited that long. Scheduled workflows can start late on a new or quiet repo; a report or a comment wakes the router
+at once.
+
 ## Limitations
 
 - **One manual step per repo:** in `oauth_token` mode, `claude setup-token` and `gh secret set`, and the token
