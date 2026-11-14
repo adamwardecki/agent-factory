@@ -147,8 +147,9 @@ test('the router can mark a PR ready, and checks out only the factory repo', () 
   assert.match(caller, /permissions:\n {2}contents: write\n/, 'a reusable workflow gets at most what its caller grants');
 });
 
-test('the report job can only dispatch', () => {
-  assert.match(section(read('.github/workflows/verify.yml'), 'report'), /permissions: \{ actions: write \}/);
+test('the report job can only read and dispatch', () => {
+  // gh workflow run looks up the default branch first, which needs contents: read (sandbox trial, verify run 1).
+  assert.match(section(read('.github/workflows/verify.yml'), 'report'), /permissions: \{ contents: read, actions: write \}/);
 });
 
 test('no workflow asks for an OIDC token in this release', () => {

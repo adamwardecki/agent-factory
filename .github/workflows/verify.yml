@@ -93,7 +93,7 @@ jobs:
     if: ${{ !cancelled() && needs.prepare.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions: { actions: write }
+    permissions: { contents: read, actions: write }
     steps:
       - env:
           GH_TOKEN: ${{ github.token }}
